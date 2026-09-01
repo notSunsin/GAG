@@ -83,6 +83,12 @@ local function toggle3dRendering(disabled)
     end)
 end
 
+
+-- 1. Matikan 3D Rendering langsung saat execute
+if Config.Disable3DRendering then
+    toggle3dRendering(true)
+    print("[Render] 3D Rendering otomatis dimatikan (Auto ON).")
+end
 -- ==============================================================================
 -- AUTO TELEPORT SAAT EXECUTE (TRADE WORLD ONLY)
 -- ==============================================================================
@@ -309,7 +315,7 @@ end
 
 -- Auto-Buy Loop Task
 task.spawn(function()
-    while task.wait(1.5) do
+    while task.wait(10) do
         if Config.AutoBuyEventShop then
             -- 1. Blood Moon Shop
             if Config.ShopAutoBuyBloodMoonAll then
