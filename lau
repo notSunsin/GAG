@@ -61,8 +61,8 @@ local Config = {
     ShopAutoBuyBloodMoonAll = true,       -- Blood Moon Shop
     ShopAutoBuyEasterAll = true,          -- Easter Seed Shop
     ShopAutoBuyTwilight = true,           -- Twilight Shop
-    ShopAutoBuyAllDatabaseShops = false,  -- Auto buy semua yang ada di ITEM_DATABASE.EventShops
-    Disable3DRendering = false            -- Disable 3D Rendering (Hemat GPU / CPU)
+    ShopAutoBuyAllDatabaseShops = true,  -- Auto buy semua yang ada di ITEM_DATABASE.EventShops
+    Disable3DRendering = true            -- Disable 3D Rendering (Hemat GPU / CPU)
 }
 
 -- Fungsi Cek Posisi Trade World
