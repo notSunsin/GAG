@@ -17,6 +17,23 @@ if ParentGui:FindFirstChild("AutoBuyTradeWorldUI") then
     ParentGui.AutoBuyTradeWorldUI:Destroy()
 end
 
+
+LocalPlayer.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new(0, 0))
+    print("[Anti-AFK] Virtual input dikirim untuk mencegah idle disconnect.")
+end)
+
+-- Backup Heartbeat Anti-AFK setiap 5 menit
+task.spawn(function()
+    while task.wait(1) do
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end
+end)
+
 -- Remotes Game
 local GameEvents = ReplicatedStorage:WaitForChild("GameEvents", 10)
 local BuyEventShopStock = GameEvents and GameEvents:FindFirstChild("BuyEventShopStock")
