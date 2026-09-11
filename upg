@@ -1,0 +1,1275 @@
+--[[
+    ========================================================================================
+    GAG (Grow a Garden) - Mobile Simple Edition (Delta Mobile Compatible)
+    ----------------------------------------------------------------------------------------
+    1. UI Sederhana & Ringan tanpa icon/emoji (kompatibel penuh font & layar Delta Mobile).
+    2. Tombol Floating Draggable [ GAG MENU ] untuk buka/tutup GUI di layar HP/Mobile.
+    3. 1-Klik = Langsung Eksekusi 10x Klik Upgrade (Pet Equip, Egg Equip, Pet Inventory).
+    4. Jeda super cepat 0.01 detik per upgrade.
+    5. Tumbal khusus: Dog, Golden Lab, Bunny.
+    6. Auto-Refresh inventori tas setiap 0.5 detik.
+    7. Auto Ascend (Garden Ascension) - LANGSUNG AKTIF saat script di-execute.
+    8. Auto Buy Trading Ticket - LANGSUNG AKTIF (Hanya gear Trading Ticket saja).
+    9. Proteksi: Pet Favorit & Sedang Di-equip tidak akan pernah ditumbal.
+    ========================================================================================
+]]
+
+-- 1. Inisialisasi Service
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- 2. Pembersihan Instance Lama
+if getgenv and getgenv().GAG_SimpleUpgrader_Gui then
+    pcall(function()
+        getgenv().GAG_SimpleUpgrader_Gui:Destroy()
+    end)
+    getgenv().GAG_SimpleUpgrader_Gui = nil
+end
+
+-- Deteksi Container GUI yang Kompatibel dengan Delta Mobile
+local function GetSafeGuiParent()
+    if gethui then
+        local success, hui = pcall(gethui)
+        if success and hui then return hui end
+    end
+    local success, core = pcall(function() return CoreGui end)
+    if success and core then
+        local s, _ = pcall(function()
+            local f = Instance.new("Folder", core)
+            f:Destroy()
+        end)
+        if s then return core end
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- 3. Referensi Remote & Modul Game
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents", 10)
+local UnlockSlotFromPet = GameEvents and GameEvents:WaitForChild("UnlockSlotFromPet", 10)
+local BuyRebirth = GameEvents and GameEvents:WaitForChild("BuyRebirth", 10)
+local BuyGearStock = GameEvents and GameEvents:WaitForChild("BuyGearStock", 10)
+
+local DataServiceModule = ReplicatedStorage:WaitForChild("Modules", 10):WaitForChild("DataService", 10)
+
+local RebirthShared = nil
+pcall(function()
+    RebirthShared = require(ReplicatedStorage.Modules.RebirthShared)
+end)
+
+local RebirthConfigData = nil
+pcall(function()
+    RebirthConfigData = require(ReplicatedStorage.Data.RebirthConfigData)
+end)
+
+-- 4. Definisi Persyaratan & Metadata Slot
+local REQUIRED_AGES = {
+    [1] = 20,
+    [2] = 30,
+    [3] = 45,
+    [4] = 60,
+    [5] = 75
+}
+
+local SLOT_TYPES = {
+    {
+        Key = "Pet",
+        Name = "Pet Equip Slot",
+        ShortName = "Pet Equip (+1)",
+        DataKey = "PurchasedEquipSlots",
+        Max = 5
+    },
+    {
+        Key = "Egg",
+        Name = "Egg Equip Slot",
+        ShortName = "Egg Equip (+1)",
+        DataKey = "PurchasedEggSlots",
+        Max = 5
+    },
+    {
+        Key = "PetInventory",
+        Name = "Pet Inventory Capacity",
+        ShortName = "Inventory (+5 Slot)",
+        DataKey = "PurchasedPetInventorySlots",
+        Max = 5
+    }
+}
+
+-- Konfigurasi Script
+local Config = {
+    AllowedTumbalPets = {
+        ["Dog"] = true,
+        ["Golden Lab"] = true,
+        ["Bunny"] = true
+    },
+    ProtectMutated = true,
+    MaxAgeCapEnabled = true,
+    MaxAgeCap = 85,
+    UpgradeDelay = 0.01,
+    AutoAscend = true,          -- LANGSUNG AKTIF SAAT EXECUTE
+    AutoBuyTradeTicket = true   -- LANGSUNG AKTIF SAAT EXECUTE
+}
+
+local recentlySacrificed = {}
+local optimisticSlots = {
+    Pet = 0,
+    Egg = 0,
+    PetInventory = 0
+}
+
+local Stats = {
+    TotalAscends = 0,
+    TotalTicketsBought = 0
+}
+
+-- 5. Helper Function Data
+local function GetPlayerData()
+    local success, data = pcall(function()
+        local ds = require(DataServiceModule)
+        return ds:GetData()
+    end)
+    if success and data and data.PetsData then
+        return data
+    end
+    return nil
+end
+
+local function GetSlotCount(dataKey, slotKey)
+    local actual = 0
+    local data = GetPlayerData()
+    if data and data.PetsData then
+        actual = tonumber(data.PetsData[dataKey]) or 0
+    end
+    if slotKey and optimisticSlots[slotKey] then
+        if actual > optimisticSlots[slotKey] then
+            optimisticSlots[slotKey] = actual
+        end
+        return math.max(actual, optimisticSlots[slotKey])
+    end
+    return actual
+end
+
+-- Inisialisasi awal nilai slot
+for _, slotCfg in ipairs(SLOT_TYPES) do
+    optimisticSlots[slotCfg.Key] = GetSlotCount(slotCfg.DataKey)
+end
+
+-- 6. Helper Pencarian Pet Tumbal (Khusus Dog, Golden Lab, Bunny)
+local function GetInventoryPets()
+    local data = GetPlayerData()
+    if not data or not data.PetsData or not data.PetsData.PetInventory then
+        return {}, {}
+    end
+
+    local invData = data.PetsData.PetInventory.Data or {}
+    local equipped = data.PetsData.EquippedPets or {}
+    local petsList = {}
+
+    -- Bersihkan daftar recentlySacrificed untuk pet yang sudah hilang dari tas
+    for uuid in pairs(recentlySacrificed) do
+        if not invData[uuid] then
+            recentlySacrificed[uuid] = nil
+        end
+    end
+
+    for uuid, petObj in pairs(invData) do
+        local petData = petObj.PetData or {}
+        local petType = petObj.PetType or "Unknown"
+        local level = tonumber(petData.Level) or 0
+        local isFav = petData.IsFavorite == true
+        local isEquipped = table.find(equipped, uuid) ~= nil
+        local isMutated = petData.Mutation ~= nil and petData.Mutation ~= ""
+
+        table.insert(petsList, {
+            UUID = uuid,
+            PetType = petType,
+            Level = level,
+            Weight = petData.BaseWeight or 0,
+            Name = petData.Name or petType,
+            IsFavorite = isFav,
+            IsEquipped = isEquipped,
+            IsMutated = isMutated,
+            Raw = petObj
+        })
+    end
+
+    return petsList, equipped
+end
+
+local function FindSacrificeCandidate(minAge)
+    local allPets, _ = GetInventoryPets()
+    local candidates = {}
+
+    for _, pet in ipairs(allPets) do
+        if not pet.IsFavorite and not pet.IsEquipped and not recentlySacrificed[pet.UUID] then
+            if Config.AllowedTumbalPets[pet.PetType] == true then
+                if not (Config.ProtectMutated and pet.IsMutated) then
+                    if pet.Level >= minAge then
+                        if not Config.MaxAgeCapEnabled or pet.Level <= Config.MaxAgeCap then
+                            table.insert(candidates, pet)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if #candidates == 0 then
+        return nil, candidates
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.Level < b.Level
+    end)
+
+    return candidates[1], candidates
+end
+
+-- 7. Logika Auto Ascend & Auto Buy Trading Ticket
+local function CheckAndAutoAscend()
+    if not Config.AutoAscend or not BuyRebirth then return end
+
+    local data = GetPlayerData()
+    if not data or not data.RebirthData or not data.Sheckles then return end
+
+    local isAvailable = false
+    local price = 0
+
+    if RebirthShared then
+        local ok1, res1 = pcall(function() return RebirthShared:IsRebirthAvailable(LocalPlayer) end)
+        local ok2, res2 = pcall(function() return RebirthShared:CalculatePrice(data.RebirthData.TotalRebirths, LocalPlayer) end)
+        isAvailable = ok1 and res1
+        price = ok2 and res2 or 0
+    else
+        local resetTime = (RebirthConfigData and RebirthConfigData.RESET_TIME) or 1800
+        isAvailable = (data.RebirthData.LastRebirthTime + resetTime) <= workspace:GetServerTimeNow()
+        price = 1000000
+    end
+
+    if isAvailable and data.Sheckles >= price then
+        pcall(function()
+            local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+            local rConf = pGui and pGui:FindFirstChild("RebirthConfirmation")
+            if rConf and rConf.Enabled then
+                local GuiController = require(ReplicatedStorage.Modules.GuiController)
+                GuiController:Close(rConf)
+            end
+        end)
+
+        local ok = pcall(function()
+            BuyRebirth:FireServer()
+        end)
+        if ok then
+            Stats.TotalAscends = Stats.TotalAscends + 1
+        end
+    end
+end
+
+local function CheckAndAutoBuyTradeTicket()
+    if not Config.AutoBuyTradeTicket or not BuyGearStock then return end
+
+    local data = GetPlayerData()
+    if not data or not data.GearStock or not data.GearStock.Stocks or not data.Sheckles then return end
+
+    local ticketStockData = data.GearStock.Stocks["Trading Ticket"]
+    local stock = ticketStockData and tonumber(ticketStockData.Stock) or 0
+    local ticketPrice = 100000
+
+    if stock > 0 and data.Sheckles >= ticketPrice then
+        local ok = pcall(function()
+            BuyGearStock:FireServer("Trading Ticket")
+        end)
+        if ok then
+            Stats.TotalTicketsBought = Stats.TotalTicketsBought + 1
+        end
+    end
+end
+
+-- ========================================================================================
+-- 8. PEMBUATAN USER INTERFACE KHUSUS MOBILE (SEDERHANA, RINGAN, TANPA ICON)
+-- ========================================================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "GAG_MobileUpgrader_" .. math.random(1000, 9999)
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local targetParent = GetSafeGuiParent()
+ScreenGui.Parent = targetParent
+if getgenv then
+    getgenv().GAG_SimpleUpgrader_Gui = ScreenGui
+end
+
+-- Helper drag universal (Touch & Mouse)
+local function EnableDrag(dragFrame, targetMoveFrame)
+    local isDragging, dragStart, startPos, dragInput = false, nil, nil, nil
+
+    dragFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = true
+            dragStart = input.Position
+            startPos = targetMoveFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    isDragging = false
+                end
+            end)
+        end
+    end)
+
+    dragFrame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and isDragging then
+            local delta = input.Position - dragStart
+            targetMoveFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- Tombol Floating Mobile Toggle (Bisa digeser dengan jari di HP)
+local FloatBtn = Instance.new("TextButton")
+FloatBtn.Name = "FloatBtn"
+FloatBtn.Size = UDim2.new(0, 90, 0, 32)
+FloatBtn.Position = UDim2.new(0, 15, 0, 50)
+FloatBtn.BackgroundColor3 = Color3.fromRGB(30, 75, 45)
+FloatBtn.Text = "[ GAG MENU ]"
+FloatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FloatBtn.Font = Enum.Font.SourceSansBold
+FloatBtn.TextSize = 14
+FloatBtn.Parent = ScreenGui
+local fbCorner = Instance.new("UICorner", FloatBtn)
+fbCorner.CornerRadius = UDim.new(0, 8)
+local fbStroke = Instance.new("UIStroke", FloatBtn)
+fbStroke.Color = Color3.fromRGB(80, 180, 110)
+fbStroke.Thickness = 1.5
+
+EnableDrag(FloatBtn, FloatBtn)
+
+-- Main Frame Sederhana (Ukuran ramah mobile: 480x300)
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 480, 0, 300)
+MainFrame.Position = UDim2.new(0.5, -240, 0.5, -150)
+MainFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Parent = ScreenGui
+
+local mfCorner = Instance.new("UICorner", MainFrame)
+mfCorner.CornerRadius = UDim.new(0, 8)
+local mfStroke = Instance.new("UIStroke", MainFrame)
+mfStroke.Color = Color3.fromRGB(50, 60, 75)
+mfStroke.Thickness = 1.5
+
+FloatBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+end)
+
+-- Top Bar Header
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, 36)
+TopBar.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+local tbCorner = Instance.new("UICorner", TopBar)
+tbCorner.CornerRadius = UDim.new(0, 8)
+
+EnableDrag(TopBar, MainFrame)
+
+local TitleLbl = Instance.new("TextLabel")
+TitleLbl.Size = UDim2.new(1, -70, 1, 0)
+TitleLbl.Position = UDim2.new(0, 10, 0, 0)
+TitleLbl.BackgroundTransparency = 1
+TitleLbl.Font = Enum.Font.SourceSansBold
+TitleLbl.TextSize = 15
+TitleLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
+TitleLbl.Text = "HA HI HUB"
+TitleLbl.Parent = TopBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 44, 0, 26)
+CloseBtn.Position = UDim2.new(1, -50, 0, 5)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(150, 45, 45)
+CloseBtn.Font = Enum.Font.SourceSansBold
+CloseBtn.TextSize = 13
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Text = "HIDE"
+CloseBtn.Parent = TopBar
+local cbCorner = Instance.new("UICorner", CloseBtn)
+cbCorner.CornerRadius = UDim.new(0, 6)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+end)
+
+-- Navigation Tabs
+local NavFrame = Instance.new("Frame")
+NavFrame.Size = UDim2.new(1, -16, 0, 30)
+NavFrame.Position = UDim2.new(0, 8, 0, 40)
+NavFrame.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
+NavFrame.BorderSizePixel = 0
+NavFrame.Parent = MainFrame
+local nfCorner = Instance.new("UICorner", NavFrame)
+nfCorner.CornerRadius = UDim.new(0, 6)
+
+local TabButtons = {}
+local TabPages = {}
+local CurrentTab = "Upgrade"
+
+local TABS = {
+    { Id = "Upgrade", Name = "Upgrade Slots" },
+    { Id = "Auto", Name = "Auto Fitur" },
+    { Id = "Tumbal", Name = "Tumbal Pet" },
+    { Id = "Preview", Name = "Log" }
+}
+
+local PageContainer = Instance.new("Frame")
+PageContainer.Size = UDim2.new(1, -16, 1, -78)
+PageContainer.Position = UDim2.new(0, 8, 0, 74)
+PageContainer.BackgroundTransparency = 1
+PageContainer.Parent = MainFrame
+
+local function SwitchTab(tabId)
+    CurrentTab = tabId
+    for id, btn in pairs(TabButtons) do
+        if id == tabId then
+            btn.BackgroundColor3 = Color3.fromRGB(45, 65, 100)
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            btn.BackgroundColor3 = Color3.fromRGB(32, 36, 46)
+            btn.TextColor3 = Color3.fromRGB(160, 170, 185)
+        end
+    end
+    for id, page in pairs(TabPages) do
+        page.Visible = (id == tabId)
+    end
+end
+
+local btnWidth = 1 / #TABS
+for i, tabInfo in ipairs(TABS) do
+    local tabBtn = Instance.new("TextButton")
+    tabBtn.Size = UDim2.new(btnWidth, -4, 1, -4)
+    tabBtn.Position = UDim2.new((i - 1) * btnWidth, 2, 0, 2)
+    tabBtn.BackgroundColor3 = Color3.fromRGB(32, 36, 46)
+    tabBtn.Text = tabInfo.Name
+    tabBtn.TextColor3 = Color3.fromRGB(160, 170, 185)
+    tabBtn.Font = Enum.Font.SourceSansBold
+    tabBtn.TextSize = 13
+    tabBtn.Parent = NavFrame
+    local tCorner = Instance.new("UICorner", tabBtn)
+    tCorner.CornerRadius = UDim.new(0, 4)
+
+    tabBtn.MouseButton1Click:Connect(function()
+        SwitchTab(tabInfo.Id)
+    end)
+    TabButtons[tabInfo.Id] = tabBtn
+
+    local page = Instance.new("Frame")
+    page.Name = "Page_" .. tabInfo.Id
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.Parent = PageContainer
+    TabPages[tabInfo.Id] = page
+end
+
+-- ========================================================================================
+-- TAB 1: UPGRADE SLOTS (SEDERHANA, 1 BUTTON UTAMA, 1-KLIK = 10X EKSEKUSI)
+-- ========================================================================================
+local UpgradePage = TabPages["Upgrade"]
+
+local SlotCardsFrame = Instance.new("Frame")
+SlotCardsFrame.Size = UDim2.new(1, 0, 0, 115)
+SlotCardsFrame.BackgroundTransparency = 1
+SlotCardsFrame.Parent = UpgradePage
+
+local CardUIElements = {}
+
+for idx, slotCfg in ipairs(SLOT_TYPES) do
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(0.32, -2, 1, 0)
+    card.Position = UDim2.new((idx - 1) * 0.34, 0, 0, 0)
+    card.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+    card.BorderSizePixel = 0
+    card.Parent = SlotCardsFrame
+    local cCorner = Instance.new("UICorner", card)
+    cCorner.CornerRadius = UDim.new(0, 6)
+
+    local cardTitle = Instance.new("TextLabel")
+    cardTitle.Size = UDim2.new(1, -6, 0, 22)
+    cardTitle.Position = UDim2.new(0, 3, 0, 2)
+    cardTitle.BackgroundTransparency = 1
+    cardTitle.Font = Enum.Font.SourceSansBold
+    cardTitle.TextSize = 13
+    cardTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    cardTitle.Text = slotCfg.ShortName
+    cardTitle.Parent = card
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -6, 0, 26)
+    statusLabel.Position = UDim2.new(0, 3, 0, 24)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Font = Enum.Font.SourceSansBold
+    statusLabel.TextSize = 18
+    statusLabel.TextColor3 = Color3.fromRGB(255, 225, 90)
+    statusLabel.Text = "Lvl 0 / 5"
+    statusLabel.Parent = card
+
+    local reqLabel = Instance.new("TextLabel")
+    reqLabel.Size = UDim2.new(1, -6, 0, 22)
+    reqLabel.Position = UDim2.new(0, 3, 0, 52)
+    reqLabel.BackgroundTransparency = 1
+    reqLabel.Font = Enum.Font.SourceSans
+    reqLabel.TextSize = 12
+    reqLabel.TextColor3 = Color3.fromRGB(180, 195, 215)
+    reqLabel.Text = "Syarat: Umur >= 20"
+    reqLabel.Parent = card
+
+    local candLabel = Instance.new("TextLabel")
+    candLabel.Size = UDim2.new(1, -6, 0, 34)
+    candLabel.Position = UDim2.new(0, 3, 0, 76)
+    candLabel.BackgroundTransparency = 1
+    candLabel.Font = Enum.Font.SourceSansBold
+    candLabel.TextSize = 11
+    candLabel.TextColor3 = Color3.fromRGB(100, 230, 140)
+    candLabel.TextWrapped = true
+    candLabel.Text = "Tumbal: Memeriksa..."
+    candLabel.Parent = card
+
+    CardUIElements[slotCfg.Key] = {
+        StatusLabel = statusLabel,
+        ReqLabel = reqLabel,
+        CandLabel = candLabel,
+        Config = slotCfg
+    }
+end
+
+-- Panel Tombol 1-Klik
+local BottomPanel = Instance.new("Frame")
+BottomPanel.Size = UDim2.new(1, 0, 0, 95)
+BottomPanel.Position = UDim2.new(0, 0, 0, 122)
+BottomPanel.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+BottomPanel.BorderSizePixel = 0
+BottomPanel.Parent = UpgradePage
+local bpCorner = Instance.new("UICorner", BottomPanel)
+bpCorner.CornerRadius = UDim.new(0, 8)
+
+local Main1ClickBtn = Instance.new("TextButton")
+Main1ClickBtn.Size = UDim2.new(1, -16, 0, 44)
+Main1ClickBtn.Position = UDim2.new(0, 8, 0, 8)
+Main1ClickBtn.BackgroundColor3 = Color3.fromRGB(35, 140, 70)
+Main1ClickBtn.Font = Enum.Font.SourceSansBold
+Main1ClickBtn.TextSize = 15
+Main1ClickBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+Main1ClickBtn.Text = "UPGRADE SEMUA SLOT KE MAKS (1-KLIK)"
+Main1ClickBtn.Parent = BottomPanel
+local mbCorner = Instance.new("UICorner", Main1ClickBtn)
+mbCorner.CornerRadius = UDim.new(0, 6)
+
+local BottomSub = Instance.new("TextLabel")
+BottomSub.Size = UDim2.new(1, -16, 0, 20)
+BottomSub.Position = UDim2.new(0, 8, 0, 56)
+BottomSub.BackgroundTransparency = 1
+BottomSub.Font = Enum.Font.SourceSans
+BottomSub.TextSize = 12
+BottomSub.TextColor3 = Color3.fromRGB(200, 215, 235)
+BottomSub.Text = "Status: Siap (1x Klik = 10x Eksekusi | Dog, Golden Lab, Bunny | Jeda 0.01s)"
+BottomSub.Parent = BottomPanel
+
+local BottomSafety = Instance.new("TextLabel")
+BottomSafety.Size = UDim2.new(1, -16, 0, 16)
+BottomSafety.Position = UDim2.new(0, 8, 0, 75)
+BottomSafety.BackgroundTransparency = 1
+BottomSafety.Font = Enum.Font.SourceSans
+BottomSafety.TextSize = 11
+BottomSafety.TextColor3 = Color3.fromRGB(140, 155, 175)
+BottomSafety.Text = "Proteksi: Pet Favorit & Sedang Di-equip AMAN."
+BottomSafety.Parent = BottomPanel
+
+local function UpdateSlotCardsUI()
+    for _, slotCfg in ipairs(SLOT_TYPES) do
+        local ui = CardUIElements[slotCfg.Key]
+        if ui then
+            local current = GetSlotCount(slotCfg.DataKey, slotCfg.Key)
+            ui.StatusLabel.Text = string.format("Lvl %d / %d", current, slotCfg.Max)
+
+            if current >= slotCfg.Max then
+                ui.ReqLabel.Text = "Status: MAKS (5/5)"
+                ui.ReqLabel.TextColor3 = Color3.fromRGB(100, 255, 140)
+                ui.CandLabel.Text = "Sudah Maksimal"
+                ui.CandLabel.TextColor3 = Color3.fromRGB(150, 160, 175)
+            else
+                local nextLevel = current + 1
+                local reqAge = REQUIRED_AGES[nextLevel] or 999
+                ui.ReqLabel.Text = string.format("Syarat: Umur >= %d", reqAge)
+                ui.ReqLabel.TextColor3 = Color3.fromRGB(255, 215, 0)
+
+                local cand, list = FindSacrificeCandidate(reqAge)
+                if cand then
+                    ui.CandLabel.Text = string.format("Siap: %s (U:%d) [%d]", cand.PetType, cand.Level, #list)
+                    ui.CandLabel.TextColor3 = Color3.fromRGB(100, 230, 140)
+                else
+                    ui.CandLabel.Text = "Kurang tumbal"
+                    ui.CandLabel.TextColor3 = Color3.fromRGB(240, 120, 100)
+                end
+            end
+        end
+    end
+end
+
+-- Eksekusi 1-Klik = 10x Klik Langsung
+local isUpgradingRunning = false
+
+Main1ClickBtn.MouseButton1Click:Connect(function()
+    if isUpgradingRunning then
+        isUpgradingRunning = false
+        Main1ClickBtn.Text = "UPGRADE SEMUA SLOT KE MAKS (1-KLIK)"
+        Main1ClickBtn.BackgroundColor3 = Color3.fromRGB(35, 140, 70)
+        BottomSub.Text = "Proses dihentikan pengguna."
+        BottomSub.TextColor3 = Color3.fromRGB(255, 140, 140)
+        return
+    end
+
+    if not UnlockSlotFromPet then
+        BottomSub.Text = "Remote UnlockSlotFromPet tidak ditemukan!"
+        BottomSub.TextColor3 = Color3.fromRGB(255, 80, 80)
+        return
+    end
+
+    isUpgradingRunning = true
+    Main1ClickBtn.BackgroundColor3 = Color3.fromRGB(180, 105, 25)
+
+    task.spawn(function()
+        local totalUpgrades = 0
+        local MAX_CLICKS = 10
+
+        for clickIter = 1, MAX_CLICKS do
+            if not isUpgradingRunning then break end
+
+            Main1ClickBtn.Text = string.format("EKSEKUSI KLIK [%d/%d]... [STOP]", clickIter, MAX_CLICKS)
+            BottomSub.Text = string.format("Eksekusi Klik ke-%d dari %d (Jeda %.2fs)...", clickIter, MAX_CLICKS, Config.UpgradeDelay)
+            BottomSub.TextColor3 = Color3.fromRGB(255, 220, 120)
+
+            local didUpgradeInCycle = false
+
+            for _, slotCfg in ipairs(SLOT_TYPES) do
+                if not isUpgradingRunning then break end
+
+                local current = GetSlotCount(slotCfg.DataKey, slotCfg.Key)
+                if current < slotCfg.Max then
+                    local nextLevel = current + 1
+                    local reqAge = REQUIRED_AGES[nextLevel] or 999
+                    local candidate, _ = FindSacrificeCandidate(reqAge)
+
+                    if candidate then
+                        recentlySacrificed[candidate.UUID] = true
+                        optimisticSlots[slotCfg.Key] = current + 1
+
+                        BottomSub.Text = string.format("[Klik %d/%d | %s] Tumbal: %s (U:%d) -> Lvl %d...", 
+                            clickIter, MAX_CLICKS, slotCfg.ShortName, candidate.PetType, candidate.Level, nextLevel)
+                        BottomSub.TextColor3 = Color3.fromRGB(130, 215, 255)
+
+                        local ok, _ = pcall(function()
+                            UnlockSlotFromPet:FireServer(candidate.UUID, slotCfg.Key)
+                        end)
+
+                        if ok then
+                            totalUpgrades = totalUpgrades + 1
+                            didUpgradeInCycle = true
+                        end
+
+                        task.wait(Config.UpgradeDelay)
+                        pcall(UpdateSlotCardsUI)
+                    end
+                end
+            end
+
+            -- Cek apakah semua slot sudah maksimal
+            local allMax = true
+            for _, slotCfg in ipairs(SLOT_TYPES) do
+                if GetSlotCount(slotCfg.DataKey, slotCfg.Key) < slotCfg.Max then
+                    allMax = false
+                    break
+                end
+            end
+
+            if allMax then
+                BottomSub.Text = string.format("SEMUA SLOT TELAH MAKSIMAL (5/5)! Total: %d slot.", totalUpgrades)
+                BottomSub.TextColor3 = Color3.fromRGB(100, 255, 140)
+                break
+            end
+
+            if not didUpgradeInCycle then
+                BottomSub.Text = string.format("Selesai (Klik %d/%d)! Berhasil %d upgrade (Tumbal di tas habis).", 
+                    clickIter, MAX_CLICKS, totalUpgrades)
+                BottomSub.TextColor3 = Color3.fromRGB(255, 200, 100)
+                break
+            end
+
+            task.wait(Config.UpgradeDelay)
+        end
+
+        isUpgradingRunning = false
+        pcall(UpdateSlotCardsUI)
+
+        -- Resinkronisasi dengan server setelah delay singkat
+        task.delay(0.8, function()
+            local data = GetPlayerData()
+            if data and data.PetsData then
+                for _, slotCfg in ipairs(SLOT_TYPES) do
+                    optimisticSlots[slotCfg.Key] = tonumber(data.PetsData[slotCfg.DataKey]) or 0
+                end
+                pcall(UpdateSlotCardsUI)
+            end
+        end)
+
+        local allMax = true
+        for _, slotCfg in ipairs(SLOT_TYPES) do
+            if GetSlotCount(slotCfg.DataKey, slotCfg.Key) < slotCfg.Max then
+                allMax = false
+                break
+            end
+        end
+
+        if allMax then
+            Main1ClickBtn.Text = "SEMUA SLOT TELAH MAKSIMAL (5/5)"
+            Main1ClickBtn.BackgroundColor3 = Color3.fromRGB(45, 65, 85)
+        else
+            Main1ClickBtn.Text = "UPGRADE SEMUA SLOT KE MAKS (1-KLIK)"
+            Main1ClickBtn.BackgroundColor3 = Color3.fromRGB(35, 140, 70)
+        end
+    end)
+end)
+
+-- ========================================================================================
+-- TAB 2: AUTO FITUR (AUTO ASCEND & AUTO BUY TRADING TICKET)
+-- ========================================================================================
+local AutoPage = TabPages["Auto"]
+
+-- Row 1: Garden Ascension
+local AscendCard = Instance.new("Frame")
+AscendCard.Size = UDim2.new(1, 0, 0, 105)
+AscendCard.Position = UDim2.new(0, 0, 0, 0)
+AscendCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+AscendCard.BorderSizePixel = 0
+AscendCard.Parent = AutoPage
+local acCorner = Instance.new("UICorner", AscendCard)
+acCorner.CornerRadius = UDim.new(0, 6)
+
+local acTitle = Instance.new("TextLabel")
+acTitle.Size = UDim2.new(0.6, 0, 0, 24)
+acTitle.Position = UDim2.new(0, 10, 0, 4)
+acTitle.BackgroundTransparency = 1
+acTitle.Font = Enum.Font.SourceSansBold
+acTitle.TextSize = 14
+acTitle.TextColor3 = Color3.fromRGB(240, 240, 240)
+acTitle.TextXAlignment = Enum.TextXAlignment.Left
+acTitle.Text = "Garden Ascension (Auto Ascend)"
+acTitle.Parent = AscendCard
+
+local AscendToggleBtn = Instance.new("TextButton")
+AscendToggleBtn.Size = UDim2.new(0, 95, 0, 24)
+AscendToggleBtn.Position = UDim2.new(1, -105, 0, 4)
+AscendToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+AscendToggleBtn.Font = Enum.Font.SourceSansBold
+AscendToggleBtn.TextSize = 12
+AscendToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AscendToggleBtn.Text = "Auto: [AKTIF]"
+AscendToggleBtn.Parent = AscendCard
+local atbCorner = Instance.new("UICorner", AscendToggleBtn)
+atbCorner.CornerRadius = UDim.new(0, 4)
+
+AscendToggleBtn.MouseButton1Click:Connect(function()
+    Config.AutoAscend = not Config.AutoAscend
+    if Config.AutoAscend then
+        AscendToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        AscendToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        AscendToggleBtn.Text = "Auto: [AKTIF]"
+    else
+        AscendToggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        AscendToggleBtn.TextColor3 = Color3.fromRGB(230, 200, 200)
+        AscendToggleBtn.Text = "Auto: [MATI]"
+    end
+end)
+
+local AscendStatusLbl = Instance.new("TextLabel")
+AscendStatusLbl.Size = UDim2.new(1, -20, 0, 20)
+AscendStatusLbl.Position = UDim2.new(0, 10, 0, 30)
+AscendStatusLbl.BackgroundTransparency = 1
+AscendStatusLbl.Font = Enum.Font.SourceSansBold
+AscendStatusLbl.TextSize = 13
+AscendStatusLbl.TextColor3 = Color3.fromRGB(255, 220, 100)
+AscendStatusLbl.TextXAlignment = Enum.TextXAlignment.Left
+AscendStatusLbl.Text = "Status: Memeriksa syarat Ascension..."
+AscendStatusLbl.Parent = AscendCard
+
+local AscendReqLbl = Instance.new("TextLabel")
+AscendReqLbl.Size = UDim2.new(0.65, 0, 0, 20)
+AscendReqLbl.Position = UDim2.new(0, 10, 0, 52)
+AscendReqLbl.BackgroundTransparency = 1
+AscendReqLbl.Font = Enum.Font.SourceSans
+AscendReqLbl.TextSize = 12
+AscendReqLbl.TextColor3 = Color3.fromRGB(175, 190, 210)
+AscendReqLbl.TextXAlignment = Enum.TextXAlignment.Left
+AscendReqLbl.Text = "Harga Sheckles: Menghitung..."
+AscendReqLbl.Parent = AscendCard
+
+local AscendManualBtn = Instance.new("TextButton")
+AscendManualBtn.Size = UDim2.new(0, 120, 0, 26)
+AscendManualBtn.Position = UDim2.new(0, 10, 0, 74)
+AscendManualBtn.BackgroundColor3 = Color3.fromRGB(40, 90, 65)
+AscendManualBtn.Font = Enum.Font.SourceSansBold
+AscendManualBtn.TextSize = 12
+AscendManualBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AscendManualBtn.Text = "Ascend Sekarang"
+AscendManualBtn.Parent = AscendCard
+local ambCorner = Instance.new("UICorner", AscendManualBtn)
+ambCorner.CornerRadius = UDim.new(0, 4)
+
+AscendManualBtn.MouseButton1Click:Connect(function()
+    if BuyRebirth then
+        BuyRebirth:FireServer()
+        AscendStatusLbl.Text = "Perintah Ascend manual dikirim!"
+    end
+end)
+
+-- Row 2: Auto Buy Trading Ticket
+local TicketCard = Instance.new("Frame")
+TicketCard.Size = UDim2.new(1, 0, 0, 105)
+TicketCard.Position = UDim2.new(0, 0, 0, 112)
+TicketCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+TicketCard.BorderSizePixel = 0
+TicketCard.Parent = AutoPage
+local tcCorner = Instance.new("UICorner", TicketCard)
+tcCorner.CornerRadius = UDim.new(0, 6)
+
+local tcTitle = Instance.new("TextLabel")
+tcTitle.Size = UDim2.new(0.6, 0, 0, 24)
+tcTitle.Position = UDim2.new(0, 10, 0, 4)
+tcTitle.BackgroundTransparency = 1
+tcTitle.Font = Enum.Font.SourceSansBold
+tcTitle.TextSize = 14
+tcTitle.TextColor3 = Color3.fromRGB(240, 240, 240)
+tcTitle.TextXAlignment = Enum.TextXAlignment.Left
+tcTitle.Text = "Auto Buy Trading Ticket (Gear Khusus)"
+tcTitle.Parent = TicketCard
+
+local TicketToggleBtn = Instance.new("TextButton")
+TicketToggleBtn.Size = UDim2.new(0, 95, 0, 24)
+TicketToggleBtn.Position = UDim2.new(1, -105, 0, 4)
+TicketToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+TicketToggleBtn.Font = Enum.Font.SourceSansBold
+TicketToggleBtn.TextSize = 12
+TicketToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+TicketToggleBtn.Text = "Auto: [AKTIF]"
+TicketToggleBtn.Parent = TicketCard
+local ttbCorner = Instance.new("UICorner", TicketToggleBtn)
+ttbCorner.CornerRadius = UDim.new(0, 4)
+
+TicketToggleBtn.MouseButton1Click:Connect(function()
+    Config.AutoBuyTradeTicket = not Config.AutoBuyTradeTicket
+    if Config.AutoBuyTradeTicket then
+        TicketToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        TicketToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TicketToggleBtn.Text = "Auto: [AKTIF]"
+    else
+        TicketToggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        TicketToggleBtn.TextColor3 = Color3.fromRGB(230, 200, 200)
+        TicketToggleBtn.Text = "Auto: [MATI]"
+    end
+end)
+
+local TicketStatusLbl = Instance.new("TextLabel")
+TicketStatusLbl.Size = UDim2.new(1, -20, 0, 20)
+TicketStatusLbl.Position = UDim2.new(0, 10, 0, 30)
+TicketStatusLbl.BackgroundTransparency = 1
+TicketStatusLbl.Font = Enum.Font.SourceSansBold
+TicketStatusLbl.TextSize = 13
+TicketStatusLbl.TextColor3 = Color3.fromRGB(140, 210, 255)
+TicketStatusLbl.TextXAlignment = Enum.TextXAlignment.Left
+TicketStatusLbl.Text = "Stok di Toko: Memeriksa..."
+TicketStatusLbl.Parent = TicketCard
+
+local TicketNoteLbl = Instance.new("TextLabel")
+TicketNoteLbl.Size = UDim2.new(1, -20, 0, 20)
+TicketNoteLbl.Position = UDim2.new(0, 10, 0, 52)
+TicketNoteLbl.BackgroundTransparency = 1
+TicketNoteLbl.Font = Enum.Font.SourceSans
+TicketNoteLbl.TextSize = 11
+TicketNoteLbl.TextColor3 = Color3.fromRGB(160, 175, 195)
+TicketNoteLbl.TextXAlignment = Enum.TextXAlignment.Left
+TicketNoteLbl.Text = "Hanya membeli Trading Ticket ($100.000), tidak gear lain."
+TicketNoteLbl.Parent = TicketCard
+
+local BuyTicketManualBtn = Instance.new("TextButton")
+BuyTicketManualBtn.Size = UDim2.new(0, 120, 0, 26)
+BuyTicketManualBtn.Position = UDim2.new(0, 10, 0, 74)
+BuyTicketManualBtn.BackgroundColor3 = Color3.fromRGB(40, 75, 110)
+BuyTicketManualBtn.Font = Enum.Font.SourceSansBold
+BuyTicketManualBtn.TextSize = 12
+BuyTicketManualBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+BuyTicketManualBtn.Text = "Beli 1x Tiket"
+BuyTicketManualBtn.Parent = TicketCard
+local btmCorner = Instance.new("UICorner", BuyTicketManualBtn)
+btmCorner.CornerRadius = UDim.new(0, 4)
+
+BuyTicketManualBtn.MouseButton1Click:Connect(function()
+    if BuyGearStock then
+        BuyGearStock:FireServer("Trading Ticket")
+        TicketStatusLbl.Text = "Perintah beli Trading Ticket dikirim!"
+    end
+end)
+
+local function UpdateAutoTabUI()
+    local data = GetPlayerData()
+    if not data then return end
+
+    if data.RebirthData then
+        local totalRebirths = data.RebirthData.TotalRebirths or 0
+        local price = 0
+        local isAvail = false
+
+        if RebirthShared then
+            pcall(function()
+                price = RebirthShared:CalculatePrice(totalRebirths, LocalPlayer)
+                isAvail = RebirthShared:IsRebirthAvailable(LocalPlayer)
+            end)
+        else
+            local resetTime = (RebirthConfigData and RebirthConfigData.RESET_TIME) or 1800
+            isAvail = (data.RebirthData.LastRebirthTime + resetTime) <= workspace:GetServerTimeNow()
+        end
+
+        local sheckles = data.Sheckles or 0
+        local resetRemain = 0
+        if RebirthConfigData and data.RebirthData.LastRebirthTime then
+            resetRemain = (data.RebirthData.LastRebirthTime + RebirthConfigData.RESET_TIME) - math.floor(workspace:GetServerTimeNow())
+        end
+
+        if isAvail and sheckles >= price then
+            AscendStatusLbl.Text = "SIAP ASCEND! (Syarat Terpenuhi)"
+            AscendStatusLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
+        elseif not isAvail then
+            local timeText = resetRemain > 0 and string.format("%02d:%02d", math.floor(resetRemain / 60), resetRemain % 60) or "00:00"
+            AscendStatusLbl.Text = "Cooldown Reset: " .. timeText
+            AscendStatusLbl.TextColor3 = Color3.fromRGB(255, 180, 80)
+        else
+            AscendStatusLbl.Text = "Kurang Sheckles untuk Ascend!"
+            AscendStatusLbl.TextColor3 = Color3.fromRGB(255, 100, 100)
+        end
+
+        AscendReqLbl.Text = string.format("Ascends: %d | Harga: %s", totalRebirths, tostring(price))
+    end
+
+    if data.GearStock and data.GearStock.Stocks then
+        local ticketData = data.GearStock.Stocks["Trading Ticket"]
+        local stock = ticketData and tonumber(ticketData.Stock) or 0
+        TicketStatusLbl.Text = string.format("Stok Tiket: %d buah | Total Terbeli: %d", stock, Stats.TotalTicketsBought)
+        if stock > 0 then
+            TicketStatusLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
+        else
+            TicketStatusLbl.TextColor3 = Color3.fromRGB(255, 180, 80)
+        end
+    end
+end
+
+-- ========================================================================================
+-- TAB 3: DAFTAR PET TUMBAL (DOG, GOLDEN LAB, BUNNY)
+-- ========================================================================================
+local TumbalPage = TabPages["Tumbal"]
+
+local TumbalHeader = Instance.new("TextLabel")
+TumbalHeader.Size = UDim2.new(1, 0, 0, 22)
+TumbalHeader.BackgroundTransparency = 1
+TumbalHeader.Font = Enum.Font.SourceSansBold
+TumbalHeader.TextSize = 13
+TumbalHeader.TextColor3 = Color3.fromRGB(255, 215, 90)
+TumbalHeader.TextXAlignment = Enum.TextXAlignment.Left
+TumbalHeader.Text = "Tumbal Khusus: Dog, Golden Lab, Bunny"
+TumbalHeader.Parent = TumbalPage
+
+local TumbalCardsUI = {}
+local TUMBAL_PETS_DISPLAY = { "Dog", "Golden Lab", "Bunny" }
+
+for i, petType in ipairs(TUMBAL_PETS_DISPLAY) do
+    local row = Instance.new("Frame")
+    row.Name = petType
+    row.Size = UDim2.new(1, 0, 0, 36)
+    row.Position = UDim2.new(0, 0, 0, 24 + (i - 1) * 40)
+    row.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+    row.BorderSizePixel = 0
+    row.Parent = TumbalPage
+    local rCorner = Instance.new("UICorner", row)
+    rCorner.CornerRadius = UDim.new(0, 6)
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Size = UDim2.new(0.35, 0, 1, 0)
+    nameLbl.Position = UDim2.new(0, 10, 0, 0)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Font = Enum.Font.SourceSansBold
+    nameLbl.TextSize = 13
+    nameLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    nameLbl.Text = petType
+    nameLbl.Parent = row
+
+    local countLbl = Instance.new("TextLabel")
+    countLbl.Size = UDim2.new(0.35, 0, 1, 0)
+    countLbl.Position = UDim2.new(0.36, 0, 0, 0)
+    countLbl.BackgroundTransparency = 1
+    countLbl.Font = Enum.Font.SourceSans
+    countLbl.TextSize = 12
+    countLbl.TextColor3 = Color3.fromRGB(130, 230, 160)
+    countLbl.TextXAlignment = Enum.TextXAlignment.Left
+    countLbl.Text = "Di Tas: 0 | Siap: 0"
+    countLbl.Parent = row
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 85, 0, 26)
+    toggleBtn.Position = UDim2.new(1, -92, 0, 5)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+    toggleBtn.Font = Enum.Font.SourceSansBold
+    toggleBtn.TextSize = 11
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.Text = "Tumbal: [ON]"
+    toggleBtn.Parent = row
+    local tbCorner = Instance.new("UICorner", toggleBtn)
+    tbCorner.CornerRadius = UDim.new(0, 4)
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        Config.AllowedTumbalPets[petType] = not Config.AllowedTumbalPets[petType]
+        local isAllowed = Config.AllowedTumbalPets[petType]
+        if isAllowed then
+            toggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+            toggleBtn.Text = "Tumbal: [ON]"
+        else
+            toggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+            toggleBtn.Text = "Tumbal: [OFF]"
+        end
+    end)
+
+    TumbalCardsUI[petType] = { CountLabel = countLbl, Toggle = toggleBtn }
+end
+
+local SafetyBar = Instance.new("Frame")
+SafetyBar.Size = UDim2.new(1, 0, 0, 40)
+SafetyBar.Position = UDim2.new(0, 0, 0, 155)
+SafetyBar.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+SafetyBar.BorderSizePixel = 0
+SafetyBar.Parent = TumbalPage
+local sbCorner = Instance.new("UICorner", SafetyBar)
+sbCorner.CornerRadius = UDim.new(0, 6)
+
+local MutProtectBtn = Instance.new("TextButton")
+MutProtectBtn.Size = UDim2.new(0.48, -4, 0, 28)
+MutProtectBtn.Position = UDim2.new(0, 6, 0, 6)
+MutProtectBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+MutProtectBtn.Font = Enum.Font.SourceSansBold
+MutProtectBtn.TextSize = 11
+MutProtectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MutProtectBtn.Text = "Proteksi Mutasi: [ON]"
+MutProtectBtn.Parent = SafetyBar
+local mpCorner = Instance.new("UICorner", MutProtectBtn)
+mpCorner.CornerRadius = UDim.new(0, 4)
+
+MutProtectBtn.MouseButton1Click:Connect(function()
+    Config.ProtectMutated = not Config.ProtectMutated
+    if Config.ProtectMutated then
+        MutProtectBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        MutProtectBtn.Text = "Proteksi Mutasi: [ON]"
+    else
+        MutProtectBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        MutProtectBtn.Text = "Proteksi Mutasi: [OFF]"
+    end
+end)
+
+local AgeCapBtn = Instance.new("TextButton")
+AgeCapBtn.Size = UDim2.new(0.48, -4, 0, 28)
+AgeCapBtn.Position = UDim2.new(0.52, 0, 0, 6)
+AgeCapBtn.BackgroundColor3 = Color3.fromRGB(35, 75, 115)
+AgeCapBtn.Font = Enum.Font.SourceSansBold
+AgeCapBtn.TextSize = 11
+AgeCapBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AgeCapBtn.Text = "Batas Umur: <= " .. Config.MaxAgeCap
+AgeCapBtn.Parent = SafetyBar
+local acCorner2 = Instance.new("UICorner", AgeCapBtn)
+acCorner2.CornerRadius = UDim.new(0, 4)
+
+local ageCapOptions = { 75, 80, 85, 90, 100, 999 }
+local ageCapIdx = 3
+AgeCapBtn.MouseButton1Click:Connect(function()
+    ageCapIdx = (ageCapIdx % #ageCapOptions) + 1
+    Config.MaxAgeCap = ageCapOptions[ageCapIdx]
+    if Config.MaxAgeCap >= 999 then
+        AgeCapBtn.Text = "Batas Umur: [Tanpa Batas]"
+    else
+        AgeCapBtn.Text = "Batas Umur: <= " .. Config.MaxAgeCap
+    end
+end)
+
+local function RefreshTumbalListUI()
+    local allPets, _ = GetInventoryPets()
+    local ownedCounts = { ["Dog"] = 0, ["Golden Lab"] = 0, ["Bunny"] = 0 }
+    local readyCounts = { ["Dog"] = 0, ["Golden Lab"] = 0, ["Bunny"] = 0 }
+
+    for _, p in ipairs(allPets) do
+        if ownedCounts[p.PetType] ~= nil then
+            ownedCounts[p.PetType] = ownedCounts[p.PetType] + 1
+            if not p.IsFavorite and not p.IsEquipped and not recentlySacrificed[p.UUID] then
+                if p.Level >= 20 and (not Config.MaxAgeCapEnabled or p.Level <= Config.MaxAgeCap) then
+                    readyCounts[p.PetType] = readyCounts[p.PetType] + 1
+                end
+            end
+        end
+    end
+
+    for petType, ui in pairs(TumbalCardsUI) do
+        local owned = ownedCounts[petType] or 0
+        local ready = readyCounts[petType] or 0
+        ui.CountLabel.Text = string.format("Di Tas: %d | Siap: %d", owned, ready)
+    end
+end
+
+-- ========================================================================================
+-- TAB 4: KANDIDAT SIAP / LOG
+-- ========================================================================================
+local PreviewPage = TabPages["Preview"]
+
+local PreviewHeader = Instance.new("TextLabel")
+PreviewHeader.Size = UDim2.new(1, 0, 0, 20)
+PreviewHeader.BackgroundTransparency = 1
+PreviewHeader.Font = Enum.Font.SourceSansBold
+PreviewHeader.TextSize = 13
+PreviewHeader.TextColor3 = Color3.fromRGB(255, 215, 90)
+PreviewHeader.TextXAlignment = Enum.TextXAlignment.Left
+PreviewHeader.Text = "Daftar Pet Siap Ditumbalkan (Dog, Golden Lab, Bunny):"
+PreviewHeader.Parent = PreviewPage
+
+local PreviewScroll = Instance.new("ScrollingFrame")
+PreviewScroll.Size = UDim2.new(1, 0, 1, -26)
+PreviewScroll.Position = UDim2.new(0, 0, 0, 24)
+PreviewScroll.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
+PreviewScroll.BorderSizePixel = 0
+PreviewScroll.ScrollBarThickness = 5
+PreviewScroll.Parent = PreviewPage
+local psCorner = Instance.new("UICorner", PreviewScroll)
+psCorner.CornerRadius = UDim.new(0, 6)
+
+local PreviewLayout = Instance.new("UIListLayout")
+PreviewLayout.Padding = UDim.new(0, 3)
+PreviewLayout.Parent = PreviewScroll
+
+local function RefreshPreviewUI()
+    for _, child in ipairs(PreviewScroll:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    local _, allQualified = FindSacrificeCandidate(20)
+    if not allQualified or #allQualified == 0 then
+        local emptyLbl = Instance.new("TextLabel")
+        emptyLbl.Size = UDim2.new(1, 0, 0, 40)
+        emptyLbl.BackgroundTransparency = 1
+        emptyLbl.Font = Enum.Font.SourceSans
+        emptyLbl.TextSize = 12
+        emptyLbl.TextColor3 = Color3.fromRGB(150, 160, 175)
+        emptyLbl.Text = "Tidak ada pet yang siap ditumbal (Umur >= 20 & Tidak Favorit)."
+        emptyLbl.Parent = PreviewScroll
+        PreviewScroll.CanvasSize = UDim2.new(0, 0, 0, 50)
+        return
+    end
+
+    for i, pet in ipairs(allQualified) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -6, 0, 28)
+        row.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(28, 32, 42) or Color3.fromRGB(32, 36, 48)
+        row.BorderSizePixel = 0
+        row.Parent = PreviewScroll
+        local rCorner = Instance.new("UICorner", row)
+        rCorner.CornerRadius = UDim.new(0, 4)
+
+        local pNameLbl = Instance.new("TextLabel")
+        pNameLbl.Size = UDim2.new(0.35, 0, 1, 0)
+        pNameLbl.Position = UDim2.new(0, 8, 0, 0)
+        pNameLbl.BackgroundTransparency = 1
+        pNameLbl.Font = Enum.Font.SourceSansBold
+        pNameLbl.TextSize = 12
+        pNameLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+        pNameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        pNameLbl.Text = string.format("%d. %s", i, pet.PetType)
+        pNameLbl.Parent = row
+
+        local pAgeLbl = Instance.new("TextLabel")
+        pAgeLbl.Size = UDim2.new(0.25, 0, 1, 0)
+        pAgeLbl.Position = UDim2.new(0.36, 0, 0, 0)
+        pAgeLbl.BackgroundTransparency = 1
+        pAgeLbl.Font = Enum.Font.SourceSans
+        pAgeLbl.TextSize = 12
+        pAgeLbl.TextColor3 = Color3.fromRGB(255, 215, 0)
+        pAgeLbl.TextXAlignment = Enum.TextXAlignment.Left
+        pAgeLbl.Text = "Umur: " .. pet.Level
+        pAgeLbl.Parent = row
+
+        local pQualLbl = Instance.new("TextLabel")
+        pQualLbl.Size = UDim2.new(0.38, 0, 1, 0)
+        pQualLbl.Position = UDim2.new(0.62, 0, 0, 0)
+        pQualLbl.BackgroundTransparency = 1
+        pQualLbl.Font = Enum.Font.SourceSansBold
+        pQualLbl.TextSize = 11
+        pQualLbl.TextColor3 = Color3.fromRGB(100, 230, 140)
+        pQualLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+        local eligibleSlots = {}
+        for sIdx, ageReq in ipairs(REQUIRED_AGES) do
+            if pet.Level >= ageReq then
+                table.insert(eligibleSlots, "Slot " .. sIdx)
+            end
+        end
+        pQualLbl.Text = "Siap: " .. table.concat(eligibleSlots, ", ")
+        pQualLbl.Parent = row
+    end
+
+    PreviewScroll.CanvasSize = UDim2.new(0, 0, 0, #allQualified * 32 + 10)
+end
+
+-- ========================================================================================
+-- 9. BACKGROUND THREAD AUTO REFRESH (0.5 DETIK)
+-- ========================================================================================
+task.spawn(function()
+    while ScreenGui.Parent do
+        pcall(function()
+            UpdateSlotCardsUI()
+            if CurrentTab == "Tumbal" then
+                RefreshTumbalListUI()
+            elseif CurrentTab == "Preview" then
+                RefreshPreviewUI()
+            elseif CurrentTab == "Auto" then
+                UpdateAutoTabUI()
+            end
+
+            -- Auto Garden Ascension
+            CheckAndAutoAscend()
+
+            -- Auto Buy Trading Ticket
+            CheckAndAutoBuyTradeTicket()
+        end)
+        task.wait(0.5)
+    end
+end)
+
+-- Inisialisasi Pertama
+SwitchTab("Upgrade")
+RefreshTumbalListUI()
+UpdateSlotCardsUI()
+UpdateAutoTabUI()
+print("[GAG Upgrader Mobile] Berhasil dimuat untuk Delta Mobile!")
