@@ -1,24 +1,12 @@
---[[
-    ========================================================================================
-    GAG (Grow a Garden) - Mobile Simple Edition (Delta Mobile Compatible)
-    ----------------------------------------------------------------------------------------
-    1. UI Sederhana & Ringan tanpa icon/emoji (kompatibel penuh font & layar Delta Mobile).
-    2. Tombol Floating Draggable [ GAG MENU ] untuk buka/tutup GUI di layar HP/Mobile.
-    3. 1-Klik = Langsung Eksekusi 10x Klik Upgrade (Pet Equip, Egg Equip, Pet Inventory).
-    4. Jeda super cepat 0.01 detik per upgrade.
-    5. Tumbal khusus: Dog, Golden Lab, Bunny.
-    6. Auto-Refresh inventori tas setiap 0.5 detik.
-    7. Auto Ascend (Garden Ascension) - LANGSUNG AKTIF saat script di-execute.
-    8. Auto Buy Trading Ticket - LANGSUNG AKTIF (Hanya gear Trading Ticket saja).
-    9. Proteksi: Pet Favorit & Sedang Di-equip tidak akan pernah ditumbal.
-    ========================================================================================
-]]
 
--- 1. Inisialisasi Service
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
@@ -53,7 +41,26 @@ local UnlockSlotFromPet = GameEvents and GameEvents:WaitForChild("UnlockSlotFrom
 local BuyRebirth = GameEvents and GameEvents:WaitForChild("BuyRebirth", 10)
 local BuyGearStock = GameEvents and GameEvents:WaitForChild("BuyGearStock", 10)
 
+-- Remote Pet Gift (Sistem Kirim/Gift Pet di GAG)
+local GiftPetRemote = GameEvents and GameEvents:WaitForChild("GiftPet", 10)
+local AcceptPetGiftRemote = GameEvents and GameEvents:WaitForChild("AcceptPetGift", 10)
+local PetGiftingServiceRemote = GameEvents and GameEvents:WaitForChild("PetGiftingService", 10)
+
+-- Remote Trade Plaza
+local TradeEvents = GameEvents and GameEvents:WaitForChild("TradeEvents", 10)
+local SendRequestRemote = TradeEvents and TradeEvents:WaitForChild("SendRequest", 5)
+local RespondRequestRemote = TradeEvents and TradeEvents:WaitForChild("RespondRequest", 5)
+local AcceptRemote = TradeEvents and TradeEvents:WaitForChild("Accept", 5)
+local ConfirmRemote = TradeEvents and TradeEvents:WaitForChild("Confirm", 5)
+local DeclineRemote = TradeEvents and TradeEvents:WaitForChild("Decline", 5)
+local UpdateTradeStateRemote = TradeEvents and TradeEvents:WaitForChild("UpdateTradeState", 5)
+
 local DataServiceModule = ReplicatedStorage:WaitForChild("Modules", 10):WaitForChild("DataService", 10)
+
+local TradingController = nil
+pcall(function()
+    TradingController = require(ReplicatedStorage.Modules.TradeControllers.TradingController)
+end)
 
 local RebirthShared = nil
 pcall(function()
@@ -110,7 +117,18 @@ local Config = {
     MaxAgeCap = 85,
     UpgradeDelay = 0.01,
     AutoAscend = true,          -- LANGSUNG AKTIF SAAT EXECUTE
-    AutoBuyTradeTicket = true   -- LANGSUNG AKTIF SAAT EXECUTE
+    AutoBuyTradeTicket = true,  -- LANGSUNG AKTIF SAAT EXECUTE
+
+    -- FITUR AUTO ACCEPT TRADE & GIFT PET
+    AutoTradePet = true,               -- LANGSUNG AKTIF: Otomatis Accept Trade & Gift Pet
+    AutoAcceptTradeRequest = true,     -- LANGSUNG AKTIF: Otomatis Terima Ajakan Trade
+    AutoAcceptPetGift = true,          -- LANGSUNG AKTIF: Otomatis Terima Pet Gift ("Gift from @player")
+    TradeConditionMode = "Both",       -- "Both" (15 Pet atau Tas=15), "Exact15", "TargetInventory15"
+    TradeTargetPetCount = 15,          -- Syarat menerima 15 pet dalam 1 trade
+    TradeTargetInventoryCount = 15,    -- Syarat total pet tumbal di tas = 15
+    TradePetFilter = "TumbalOnly",     -- "TumbalOnly" (Dog, Lab, Bunny) atau "AllPets"
+    TradeStopWhenInventoryFull = true, -- Jeda auto accept jika tas sudah memiliki 15 tumbal
+    SafetyDeclineIfWeOffer = true      -- PROTEKSI ANTI-SCAM: Hanya menerima, tolak jika kita menawarkan item
 }
 
 local recentlySacrificed = {}
@@ -122,7 +140,25 @@ local optimisticSlots = {
 
 local Stats = {
     TotalAscends = 0,
-    TotalTicketsBought = 0
+    TotalTicketsBought = 0,
+    TotalTradesAccepted = 0,
+    TotalGiftsAccepted = 0
+}
+
+-- Runtime State untuk Auto Trade & Gift
+local TradeRuntime = {
+    IsTrading = false,
+    StatusText = "Siap menerima Gift & Trade...",
+    StatusColor = Color3.fromRGB(180, 195, 215),
+    DetailText = "Belum ada sesi trade atau gift masuk.",
+    CooldownRemaining = 0,
+    OfferedPets = 0,
+    OfferedTumbal = 0,
+    MyItemsCount = 0,
+    MyState = "None",
+    OtherState = "None",
+    OtherPlayerName = "Pemain",
+    LastActionTime = 0
 }
 
 -- 5. Helper Function Data
@@ -197,6 +233,25 @@ local function GetInventoryPets()
     end
 
     return petsList, equipped
+end
+
+local function GetTumbalCounts()
+    local allPets, _ = GetInventoryPets()
+    local totalOwned = 0
+    local totalReady = 0
+
+    for _, p in ipairs(allPets) do
+        if Config.AllowedTumbalPets[p.PetType] == true then
+            if not p.IsFavorite and not p.IsEquipped and not recentlySacrificed[p.UUID] then
+                totalOwned = totalOwned + 1
+                if p.Level >= 20 and (not Config.MaxAgeCapEnabled or p.Level <= Config.MaxAgeCap) then
+                    totalReady = totalReady + 1
+                end
+            end
+        end
+    end
+
+    return totalOwned, totalReady
 end
 
 local function FindSacrificeCandidate(minAge)
@@ -286,6 +341,593 @@ local function CheckAndAutoBuyTradeTicket()
             Stats.TotalTicketsBought = Stats.TotalTicketsBought + 1
         end
     end
+end
+
+-- ========================================================================================
+-- 7B. LOGIKA AUTO ACCEPT PET GIFT (GIFT NOTIFICATION POPUP & REMOTE)
+-- ========================================================================================
+
+-- Helper universal untuk mengeksekusi klik tombol Accept pada popup Gift di mobile
+local function TriggerButtonAccept(acceptBtn, giftFrame)
+    if not acceptBtn then return false end
+    local clicked = false
+    local foundGiftId = nil
+
+    -- Method 1: getconnections (Ekstraksi giftId & eksekusi fungsi bawaan)
+    if getconnections then
+        local conns = getconnections(acceptBtn.MouseButton1Click)
+        if conns and #conns > 0 then
+            for _, conn in ipairs(conns) do
+                -- Ekstrak giftId (UUID) dari upvalues callback game
+                pcall(function()
+                    if debug and debug.getupvalues and type(conn.Function) == "function" then
+                        local upvals = debug.getupvalues(conn.Function)
+                        for _, val in pairs(upvals) do
+                            if typeof(val) == "string" and #val >= 30 and val:find("-") then
+                                foundGiftId = val
+                                break
+                            end
+                        end
+                    end
+                end)
+
+                if type(conn.Function) == "function" then
+                    pcall(conn.Function)
+                    clicked = true
+                elseif conn.Fire then
+                    pcall(function() conn:Fire() end)
+                    clicked = true
+                end
+            end
+        end
+
+        local connsAct = getconnections(acceptBtn.Activated)
+        if connsAct and #connsAct > 0 then
+            for _, conn in ipairs(connsAct) do
+                if type(conn.Function) == "function" then
+                    pcall(conn.Function)
+                    clicked = true
+                elseif conn.Fire then
+                    pcall(function() conn:Fire() end)
+                    clicked = true
+                end
+            end
+        end
+    end
+
+    -- Jika giftId ditemukan dari upvalue, tembak langsung AcceptPetGift Remote
+    if foundGiftId and AcceptPetGiftRemote then
+        pcall(function()
+            AcceptPetGiftRemote:FireServer(true, foundGiftId)
+            print("[GAG Auto Gift] AcceptPetGift terkirim untuk ID:", foundGiftId)
+        end)
+    end
+
+    -- Method 2: firesignal
+    if firesignal then
+        pcall(function() firesignal(acceptBtn.MouseButton1Click) end)
+        pcall(function() firesignal(acceptBtn.Activated) end)
+    end
+
+    -- Method 3: VirtualInputManager simulasi sentuhan/klik
+    if VirtualInputManager then
+        pcall(function()
+            local pos = acceptBtn.AbsolutePosition + acceptBtn.AbsoluteSize / 2
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+            task.wait(0.02)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+            clicked = true
+        end)
+    end
+
+    -- Hapus instance UI pop-up dari layar agar tidak menutupi HP
+    if giftFrame then
+        pcall(function()
+            task.delay(0.05, function()
+                if giftFrame and giftFrame.Parent then
+                    giftFrame:Destroy()
+                end
+            end)
+        end)
+    end
+
+    return clicked
+end
+
+-- Memproses semua popup Gift Pet yang sedang ada di layar
+local function ProcessPendingPetGifts()
+    local currentTumbal, readyCount = GetTumbalCounts()
+
+    -- JIKA ISI TAS SUDAH 15/15 TUMBAL, TOGGLE OTOMATIS DIMATIKAN (OFF)
+    if currentTumbal >= Config.TradeTargetInventoryCount then
+        if Config.AutoTradePet then
+            Config.AutoTradePet = false
+            print(string.format("[GAG Auto Trade] Tas sudah terisi %d/15 tumbal. Toggle Auto Trade otomatis MATI (OFF)!", currentTumbal))
+        end
+        TradeRuntime.StatusText = "Auto Trade MATI (Tas 15/15 Tumbal)"
+        TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+        TradeRuntime.DetailText = string.format("Tas sudah memiliki %d/15 tumbal (Siap: %d). Toggle Auto Trade otomatis OFF.", 
+            currentTumbal, readyCount)
+        return
+    end
+
+    if not Config.AutoTradePet or not Config.AutoAcceptPetGift then return end
+
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local giftNotif = pGui and pGui:FindFirstChild("Gift_Notification")
+    local frame = giftNotif and giftNotif:FindFirstChild("Frame")
+    if not frame then return end
+
+    for _, child in ipairs(frame:GetChildren()) do
+        -- 1. Cek jika ini popup Gift Pet (memiliki child 'Holder')
+        local holder = child:FindFirstChild("Holder")
+        if holder then
+            local descLabel = holder:FindFirstChild("TextLabel")
+            local notifUI = holder:FindFirstChild("Notification_UI")
+            local senderLabel = notifUI and notifUI:FindFirstChild("TextLabel")
+            local btnFrame = holder:FindFirstChild("Frame")
+            local acceptBtn = btnFrame and btnFrame:FindFirstChild("Accept")
+
+            if acceptBtn then
+                local descText = descLabel and descLabel.Text or "Pet"
+                local senderText = senderLabel and senderLabel.Text or "Pengirim"
+
+                -- Ekstrak nama pet (contoh: "Bunny [10.22 KG] [Age 77]" -> "Bunny")
+                local petType = descText:match("^(.-)%s*%[") or descText
+                petType = petType:gsub("^%s*(.-)%s*$", "%1")
+
+                -- Cek filter pet tumbal
+                local isAllowed = (Config.TradePetFilter ~= "TumbalOnly") or (Config.AllowedTumbalPets[petType] == true)
+
+                if isAllowed then
+                    TradeRuntime.StatusText = "Menerima Gift: " .. petType
+                    TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+                    TradeRuntime.DetailText = string.format("Menerima %s dari %s (Tas: %d/%d)", 
+                        descText, senderText, currentTumbal, Config.TradeTargetInventoryCount)
+
+                    TriggerButtonAccept(acceptBtn, child)
+                    Stats.TotalGiftsAccepted = Stats.TotalGiftsAccepted + 1
+                    task.wait(0.08)
+                else
+                    TradeRuntime.StatusText = "Gift Dilewati (Bukan Tumbal)"
+                    TradeRuntime.DetailText = string.format("Pet '%s' bukan tumbal (Dog, Lab, Bunny)", petType)
+                end
+            end
+        end
+
+        -- 2. Cek jika ini popup Plaza Trade Request (memiliki child 'Wrapper')
+        local wrapper = child:FindFirstChild("Wrapper")
+        if wrapper and Config.AutoAcceptTradeRequest then
+            local canvas = wrapper:FindFirstChild("Canvas")
+            local seg = canvas and canvas:FindFirstChild("Segment")
+            local buttons = seg and seg:FindFirstChild("Buttons")
+            local accBtn = buttons and buttons:FindFirstChild("ACCEPT_BUTTON")
+            local sensor = accBtn and accBtn:FindFirstChild("Main") and accBtn.Main:FindFirstChild("SENSOR")
+            if sensor then
+                TradeRuntime.StatusText = "Menerima Trade Request..."
+                TradeRuntime.StatusColor = Color3.fromRGB(130, 220, 255)
+                if getconnections then
+                    for _, c in ipairs(getconnections(sensor.Activated) or {}) do c:Fire() end
+                    for _, c in ipairs(getconnections(sensor.MouseButton1Click) or {}) do c:Fire() end
+                end
+                task.wait(0.08)
+            end
+        end
+    end
+end
+
+-- Event listener langsung saat remote GiftPet ditembak oleh server
+if GiftPetRemote then
+    GiftPetRemote.OnClientEvent:Connect(function(giftId, petDescription, senderName)
+        print(string.format("[GAG Auto Gift] Incoming GiftPet: ID=%s, Desc=%s, Sender=%s", 
+            tostring(giftId), tostring(petDescription), tostring(senderName)))
+
+        if not Config.AutoTradePet or not Config.AutoAcceptPetGift then return end
+
+        local currentTumbal, readyCount = GetTumbalCounts()
+        if currentTumbal >= Config.TradeTargetInventoryCount then
+            Config.AutoTradePet = false
+            TradeRuntime.StatusText = "Auto Trade MATI (Tas 15/15 Tumbal)"
+            TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+            TradeRuntime.DetailText = string.format("Tas sudah memiliki %d/15 tumbal! Toggle Auto Trade dimatikan otomatis.", currentTumbal)
+            print(string.format("[GAG Auto Trade] Tas sudah %d/15 tumbal. AutoTradePet otomatis OFF.", currentTumbal))
+            return
+        end
+
+        local descStr = tostring(petDescription or "Pet")
+        local petType = descStr:match("^(.-)%s*%[") or descStr
+        petType = petType:gsub("^%s*(.-)%s*$", "%1")
+
+        if Config.TradePetFilter == "TumbalOnly" and not Config.AllowedTumbalPets[petType] then
+            TradeRuntime.StatusText = "Gift Ditolak (Bukan Tumbal)"
+            TradeRuntime.DetailText = string.format("Pet '%s' bukan tumbal (Dog, Lab, Bunny)", petType)
+            return
+        end
+
+        TradeRuntime.StatusText = "Menerima Gift: " .. petType
+        TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+        TradeRuntime.DetailText = string.format("Menerima %s dari @%s (Tas: %d/%d)", 
+            descStr, tostring(senderName or "Pemain"), currentTumbal + 1, Config.TradeTargetInventoryCount)
+
+        -- LANGSUNG TEMBAK ACCEPT REMOTE
+        pcall(function()
+            if AcceptPetGiftRemote then
+                AcceptPetGiftRemote:FireServer(true, giftId)
+                print("[GAG Auto Gift] Sukses mengirim AcceptPetGift(true, " .. tostring(giftId) .. ")")
+                Stats.TotalGiftsAccepted = Stats.TotalGiftsAccepted + 1
+            end
+        end)
+
+        -- Bersihkan popup yang mungkin dibuat oleh script game
+        task.delay(0.08, function()
+            pcall(function()
+                local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+                local giftNotif = pGui and pGui:FindFirstChild("Gift_Notification")
+                local frame = giftNotif and giftNotif:FindFirstChild("Frame")
+                if frame then
+                    for _, c in ipairs(frame:GetChildren()) do
+                        local h = c:FindFirstChild("Holder")
+                        local txt = h and h:FindFirstChild("TextLabel")
+                        if txt and txt.Text == descStr then
+                            c:Destroy()
+                        end
+                    end
+                end
+            end)
+        end)
+    end)
+end
+
+-- ========================================================================================
+-- 7C. LOGIKA AUTO ACCEPT PLAZA TRADE (HANYA SAAT 15 PET / TOTAL TAS = 15)
+-- ========================================================================================
+
+-- Helper membaca detail penawaran trade saat ini
+local function GetCurrentTradeDetails()
+    local replicator = TradingController and TradingController.CurrentTradeReplicator
+    if replicator then
+        local data = nil
+        pcall(function()
+            data = replicator:GetData()
+        end)
+
+        if data and data.players and data.offers then
+            local myIdx = table.find(data.players, LocalPlayer)
+            local otherIdx = (myIdx == 1) and 2 or 1
+            local otherPlayer = data.players[otherIdx]
+            local otherPlayerName = otherPlayer and otherPlayer.Name or "Pemain"
+
+            local myState = "None"
+            local otherState = "None"
+            if myIdx and data.states then
+                myState = data.states[myIdx] or "None"
+            end
+            if otherIdx and data.states then
+                otherState = data.states[otherIdx] or "None"
+            end
+
+            local cooldownRemain = 0
+            if data.lastChange then
+                local elapsed = workspace:GetServerTimeNow() - data.lastChange
+                cooldownRemain = math.max(0, 5 - elapsed)
+            end
+
+            local myItemsCount = 0
+            local mySheckles = 0
+            local myTokens = 0
+            local myOffer = myIdx and data.offers[myIdx]
+            if myOffer then
+                myItemsCount = #(myOffer.items or {})
+                mySheckles = myOffer.sheckles or 0
+                myTokens = myOffer.tokens or 0
+            end
+
+            local otherOffer = otherIdx and data.offers[otherIdx]
+            local otherPetsCount = 0
+            local otherTumbalCount = 0
+            local otherItemsList = {}
+
+            if otherOffer and otherOffer.items then
+                for _, item in ipairs(otherOffer.items) do
+                    table.insert(otherItemsList, item)
+                    if item.type == "Pet" then
+                        otherPetsCount = otherPetsCount + 1
+                        local pType = (item.data and item.data.PetType) or ""
+                        if Config.AllowedTumbalPets[pType] == true then
+                            otherTumbalCount = otherTumbalCount + 1
+                        end
+                    end
+                end
+            end
+
+            return true, {
+                OtherPlayerName = otherPlayerName,
+                MyItemsCount = myItemsCount,
+                MySheckles = mySheckles,
+                MyTokens = myTokens,
+                OtherPetsCount = otherPetsCount,
+                OtherTumbalCount = otherTumbalCount,
+                TotalOtherItems = #otherItemsList,
+                CooldownRemaining = cooldownRemain,
+                MyState = myState,
+                OtherState = otherState
+            }
+        end
+    end
+
+    -- Fallback membaca dari PlayerGui.TradingUI.LiveTrade
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local tradingUI = pGui and pGui:FindFirstChild("TradingUI")
+    local liveTrade = tradingUI and tradingUI:FindFirstChild("LiveTrade")
+    if liveTrade and liveTrade.Visible then
+        local otherPlr = liveTrade:FindFirstChild("OtherPlr")
+        local myPlr = liveTrade:FindFirstChild("MyPlr")
+        local options = liveTrade:FindFirstChild("Options")
+        local acceptBtn = options and options:FindFirstChild("Accept")
+        local acceptLabel = acceptBtn and acceptBtn:FindFirstChild("Label")
+
+        local otherName = "Pemain"
+        pcall(function()
+            local pNameText = otherPlr and otherPlr:FindFirstChild("Price") and otherPlr.Price:FindFirstChild("Label")
+            if pNameText and pNameText.Text then
+                otherName = pNameText.Text:match("@([^']+)") or "Pemain"
+            end
+        end)
+
+        local cooldownRemain = 0
+        local myState = "None"
+        local otherState = "None"
+
+        if acceptLabel then
+            local txt = acceptLabel.Text
+            local sec = txt:match("(%d+%.?%d*)s")
+            if sec then
+                cooldownRemain = tonumber(sec) or 0
+            end
+            if txt == "Accepted" then
+                myState = "Accepted"
+            elseif txt == "Confirm" then
+                myState = "Accepted"
+                otherState = "Accepted"
+            elseif txt == "Confirmed" then
+                myState = "Confirmed"
+            end
+        end
+
+        local otherPetsCount = 0
+        if otherPlr and otherPlr:FindFirstChild("ScrollingFrame") then
+            for _, child in ipairs(otherPlr.ScrollingFrame:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible and child.Name ~= "AddItemButtom" then
+                    otherPetsCount = otherPetsCount + 1
+                end
+            end
+        end
+
+        local myItemsCount = 0
+        if myPlr and myPlr:FindFirstChild("ScrollingFrame") then
+            for _, child in ipairs(myPlr.ScrollingFrame:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible and child.Name ~= "AddItemButtom" and child.Name ~= "ItemTemplate" then
+                    myItemsCount = myItemsCount + 1
+                end
+            end
+        end
+
+        return true, {
+            OtherPlayerName = otherName,
+            MyItemsCount = myItemsCount,
+            MySheckles = 0,
+            MyTokens = 0,
+            OtherPetsCount = otherPetsCount,
+            OtherTumbalCount = otherPetsCount,
+            TotalOtherItems = otherPetsCount,
+            CooldownRemaining = cooldownRemain,
+            MyState = myState,
+            OtherState = otherState
+        }
+    end
+
+    return false, nil
+end
+
+-- Evaluasi kelayakan penawaran trade berdasarkan konfigurasi user
+local function EvaluateTradeOffer(info)
+    if not Config.AutoTradePet then
+        return false, "Fitur Auto Trade sedang dinonaktifkan."
+    end
+
+    -- 1. PROTEKSI KEAMANAN ANTI-SCAM:
+    if Config.SafetyDeclineIfWeOffer then
+        if info.MyItemsCount > 0 or info.MySheckles > 0 or info.MyTokens > 0 then
+            return false, "ANTI-SCAM: Penawaran Anda tidak kosong! Trade dibatalkan demi keamanan."
+        end
+    end
+
+    local currentTumbal, _ = GetTumbalCounts()
+    local offeredRelevant = (Config.TradePetFilter == "TumbalOnly") and info.OtherTumbalCount or info.OtherPetsCount
+
+    -- Kondisi A: Menerima 15 pet saja (atau target pet count)
+    local condMenerima15 = (offeredRelevant >= Config.TradeTargetPetCount)
+
+    -- Kondisi B: Total pet tumbal di tas saat ini + incoming tepat = 15
+    local condTotalTas15 = (currentTumbal + offeredRelevant == Config.TradeTargetInventoryCount)
+
+    -- Kondisi C: Tas saat ini belum 15 dan menerima cukup pet hingga tas mencapai/melebihi 15
+    local condReachTas15 = (currentTumbal < Config.TradeTargetInventoryCount and (currentTumbal + offeredRelevant >= Config.TradeTargetInventoryCount))
+
+    local isEligible = false
+    if Config.TradeConditionMode == "Exact15" then
+        isEligible = condMenerima15
+    elseif Config.TradeConditionMode == "TargetInventory15" then
+        isEligible = condTotalTas15 or condReachTas15
+    else -- "Both" (Default: Menerima 15 Pet Saja ATAU Total Tas = 15)
+        isEligible = condMenerima15 or condTotalTas15 or condReachTas15
+    end
+
+    if not isEligible then
+        return false, string.format("Menunggu syarat: Ditawarkan %d/%d pet | Tas: %d/%d tumbal",
+            offeredRelevant, Config.TradeTargetPetCount, currentTumbal, Config.TradeTargetInventoryCount)
+    end
+
+    return true, string.format("Syarat TERPENUHI! (%d pet | Tas: %d/15)", offeredRelevant, currentTumbal + offeredRelevant)
+end
+
+-- Eksekusi logika trade per frame / loop
+local function ProcessPlazaTrade()
+    local isTrading, info = GetCurrentTradeDetails()
+    TradeRuntime.IsTrading = isTrading
+
+    local currentTumbal, readyTumbal = GetTumbalCounts()
+    TradeRuntime.CurrentInventoryTumbal = currentTumbal
+
+    if not isTrading or not info then
+        return
+    end
+
+    -- Update info runtime saat sedang trade
+    TradeRuntime.OtherPlayerName = info.OtherPlayerName
+    TradeRuntime.OfferedPets = info.OtherPetsCount
+    TradeRuntime.OfferedTumbal = info.OtherTumbalCount
+    TradeRuntime.MyItemsCount = info.MyItemsCount
+    TradeRuntime.CooldownRemaining = info.CooldownRemaining
+    TradeRuntime.MyState = info.MyState
+    TradeRuntime.OtherState = info.OtherState
+
+    -- Cek anti-scam jika akun kita ikut menawarkan item
+    if Config.SafetyDeclineIfWeOffer and (info.MyItemsCount > 0 or info.MySheckles > 0 or info.MyTokens > 0) then
+        TradeRuntime.StatusText = "TOLAK TRADE (Anti-Scam)"
+        TradeRuntime.StatusColor = Color3.fromRGB(255, 80, 80)
+        TradeRuntime.DetailText = "Penawaran Anda terisi! Menolak trade otomatis..."
+
+        pcall(function()
+            if DeclineRemote then DeclineRemote:FireServer() end
+            if TradingController then TradingController:Decline() end
+        end)
+        return
+    end
+
+    -- Evaluasi kelayakan
+    local isEligible, reason = EvaluateTradeOffer(info)
+    if not isEligible then
+        TradeRuntime.StatusText = "Menunggu Penawaran 15 Pet..."
+        TradeRuntime.StatusColor = Color3.fromRGB(255, 200, 90)
+        TradeRuntime.DetailText = string.format("@%s menawarkan %d pet (%s)", 
+            info.OtherPlayerName, info.OtherTumbalCount, reason)
+        return
+    end
+
+    -- Syarat terpenuhi! Handle proses Accept & Confirm
+    local offeredCount = (Config.TradePetFilter == "TumbalOnly") and info.OtherTumbalCount or info.OtherPetsCount
+    TradeRuntime.DetailText = string.format("@%s memberi %d pet. %s", info.OtherPlayerName, offeredCount, reason)
+
+    -- Auto klik "Yes" jika ada Unfair Trade Popup
+    pcall(function()
+        local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local unfairGui = pGui and pGui:FindFirstChild("UnfairTrade")
+        if unfairGui and unfairGui.Enabled then
+            local uFrame = unfairGui:FindFirstChild("UnfairTrade")
+            if uFrame and uFrame.Visible then
+                local options = uFrame:FindFirstChild("Options")
+                local yesBtn = options and options:FindFirstChild("Yes")
+                if yesBtn then
+                    for _, c in ipairs(getconnections and getconnections(yesBtn.Activated) or {}) do
+                        c:Fire()
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Cek jeda cooldown server (5 detik)
+    if info.CooldownRemaining > 0.1 then
+        TradeRuntime.StatusText = string.format("Jeda Server: %.1fs...", info.CooldownRemaining)
+        TradeRuntime.StatusColor = Color3.fromRGB(255, 220, 100)
+        return
+    end
+
+    -- Tahap 1: Mengirim Accept
+    if info.MyState == "None" then
+        TradeRuntime.StatusText = "Mengirim Accept..."
+        TradeRuntime.StatusColor = Color3.fromRGB(100, 220, 255)
+
+        pcall(function()
+            if AcceptRemote then
+                AcceptRemote:FireServer()
+            end
+            if TradingController then
+                TradingController:Accept()
+            end
+        end)
+        return
+    end
+
+    -- Tahap 2: Mengirim Confirm
+    if info.MyState == "Accepted" then
+        if info.OtherState == "Accepted" or info.CooldownRemaining <= 0 then
+            TradeRuntime.StatusText = "Mengirim Confirm..."
+            TradeRuntime.StatusColor = Color3.fromRGB(120, 255, 150)
+
+            pcall(function()
+                if ConfirmRemote then
+                    ConfirmRemote:FireServer()
+                end
+                if TradingController then
+                    TradingController:Confirm()
+                end
+            end)
+            Stats.TotalTradesAccepted = Stats.TotalTradesAccepted + 1
+        else
+            TradeRuntime.StatusText = string.format("Menunggu @%s Accept...", info.OtherPlayerName)
+            TradeRuntime.StatusColor = Color3.fromRGB(255, 215, 110)
+        end
+        return
+    end
+
+    -- Tahap 3: Selesai / Terkonfirmasi
+    if info.MyState == "Confirmed" then
+        TradeRuntime.StatusText = "Trade Dikonfirmasi!"
+        TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+        TradeRuntime.DetailText = "Menunggu server mentransfer pet ke tas..."
+    end
+end
+
+-- Listener otomatis untuk Trade Request yang masuk
+if SendRequestRemote then
+    SendRequestRemote.OnClientEvent:Connect(function(requestId, senderPlayer, expirationTime)
+        if not Config.AutoTradePet or not Config.AutoAcceptTradeRequest then return end
+
+        local currentTumbal, _ = GetTumbalCounts()
+        if Config.TradeStopWhenInventoryFull and currentTumbal >= Config.TradeTargetInventoryCount then
+            TradeRuntime.StatusText = "Request Diabaikan (Tas 15 Tumbal)"
+            TradeRuntime.DetailText = string.format("Ajakan dari %s diabaikan karena tas sudah memiliki 15 tumbal.", 
+                tostring(senderPlayer and senderPlayer.Name or "Pemain"))
+            return
+        end
+
+        TradeRuntime.StatusText = "Menerima Request Trade..."
+        TradeRuntime.StatusColor = Color3.fromRGB(130, 220, 255)
+        TradeRuntime.DetailText = string.format("Menerima ajakan trade dari @%s...", 
+            tostring(senderPlayer and senderPlayer.Name or "Pemain"))
+
+        pcall(function()
+            if RespondRequestRemote then
+                RespondRequestRemote:FireServer(requestId, true)
+            end
+        end)
+    end)
+end
+
+-- Listener saat sesi trade selesai
+if UpdateTradeStateRemote then
+    UpdateTradeStateRemote.OnClientEvent:Connect(function(tradeId)
+        if not tradeId then
+            task.delay(0.5, function()
+                local newTumbal, readyCount = GetTumbalCounts()
+                TradeRuntime.CurrentInventoryTumbal = newTumbal
+                TradeRuntime.DetailText = string.format("Sesi trade selesai. Tas saat ini: %d/%d tumbal (Siap: %d).", 
+                    newTumbal, Config.TradeTargetInventoryCount, readyCount)
+            end)
+        end
+    end)
 end
 
 -- ========================================================================================
@@ -429,7 +1071,8 @@ local TabPages = {}
 local CurrentTab = "Upgrade"
 
 local TABS = {
-    { Id = "Upgrade", Name = "Upgrade Slots" },
+    { Id = "Upgrade", Name = "Upgrade" },
+    { Id = "Trade", Name = "Auto Trade" },
     { Id = "Auto", Name = "Auto Fitur" },
     { Id = "Tumbal", Name = "Tumbal Pet" },
     { Id = "Preview", Name = "Log" }
@@ -466,7 +1109,7 @@ for i, tabInfo in ipairs(TABS) do
     tabBtn.Text = tabInfo.Name
     tabBtn.TextColor3 = Color3.fromRGB(160, 170, 185)
     tabBtn.Font = Enum.Font.SourceSansBold
-    tabBtn.TextSize = 13
+    tabBtn.TextSize = 12
     tabBtn.Parent = NavFrame
     local tCorner = Instance.new("UICorner", tabBtn)
     tCorner.CornerRadius = UDim.new(0, 4)
@@ -754,7 +1397,281 @@ Main1ClickBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ========================================================================================
--- TAB 2: AUTO FITUR (AUTO ASCEND & AUTO BUY TRADING TICKET)
+-- TAB 2: AUTO TRADE & GIFT PET (PET GIFT & PLAZA TRADE)
+-- ========================================================================================
+local TradePage = TabPages["Trade"]
+
+-- Card 1: Status & Kontrol Utama
+local TradeStatusCard = Instance.new("Frame")
+TradeStatusCard.Size = UDim2.new(1, 0, 0, 108)
+TradeStatusCard.Position = UDim2.new(0, 0, 0, 0)
+TradeStatusCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+TradeStatusCard.BorderSizePixel = 0
+TradeStatusCard.Parent = TradePage
+local tscCorner = Instance.new("UICorner", TradeStatusCard)
+tscCorner.CornerRadius = UDim.new(0, 6)
+
+local tscTitle = Instance.new("TextLabel")
+tscTitle.Size = UDim2.new(0.65, 0, 0, 24)
+tscTitle.Position = UDim2.new(0, 10, 0, 4)
+tscTitle.BackgroundTransparency = 1
+tscTitle.Font = Enum.Font.SourceSansBold
+tscTitle.TextSize = 14
+tscTitle.TextColor3 = Color3.fromRGB(240, 240, 240)
+tscTitle.TextXAlignment = Enum.TextXAlignment.Left
+tscTitle.Text = "Auto Accept Trade & Gift Pet (Target: 15)"
+tscTitle.Parent = TradeStatusCard
+
+local TradeToggleBtn = Instance.new("TextButton")
+TradeToggleBtn.Size = UDim2.new(0, 95, 0, 24)
+TradeToggleBtn.Position = UDim2.new(1, -105, 0, 4)
+TradeToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+TradeToggleBtn.Font = Enum.Font.SourceSansBold
+TradeToggleBtn.TextSize = 12
+TradeToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+TradeToggleBtn.Text = "Auto: [AKTIF]"
+TradeToggleBtn.Parent = TradeStatusCard
+local ttbCorner = Instance.new("UICorner", TradeToggleBtn)
+ttbCorner.CornerRadius = UDim.new(0, 4)
+
+TradeToggleBtn.MouseButton1Click:Connect(function()
+    Config.AutoTradePet = not Config.AutoTradePet
+    if Config.AutoTradePet then
+        local currentTumbal, _ = GetTumbalCounts()
+        if currentTumbal >= Config.TradeTargetInventoryCount then
+            TradeRuntime.StatusText = "Peringatan: Tas Sudah 15 Tumbal"
+            TradeRuntime.DetailText = string.format("Tas sudah berisi %d/15 tumbal. Auto Trade diaktifkan manual.", currentTumbal)
+        else
+            TradeRuntime.StatusText = "Auto Trade Diaktifkan"
+            TradeRuntime.DetailText = "Menunggu gift pet atau sesi trade masuk..."
+        end
+        TradeToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        TradeToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TradeToggleBtn.Text = "Auto: [AKTIF]"
+    else
+        TradeToggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        TradeToggleBtn.TextColor3 = Color3.fromRGB(230, 200, 200)
+        TradeToggleBtn.Text = "Auto: [MATI]"
+        TradeRuntime.StatusText = "Auto Trade Dimatikan Manual"
+    end
+end)
+
+local TradeStateLbl = Instance.new("TextLabel")
+TradeStateLbl.Size = UDim2.new(1, -20, 0, 20)
+TradeStateLbl.Position = UDim2.new(0, 10, 0, 30)
+TradeStateLbl.BackgroundTransparency = 1
+TradeStateLbl.Font = Enum.Font.SourceSansBold
+TradeStateLbl.TextSize = 13
+TradeStateLbl.TextColor3 = Color3.fromRGB(255, 220, 100)
+TradeStateLbl.TextXAlignment = Enum.TextXAlignment.Left
+TradeStateLbl.Text = "Status: Siap menerima Gift & Trade..."
+TradeStateLbl.Parent = TradeStatusCard
+
+local TradeDetailLbl = Instance.new("TextLabel")
+TradeDetailLbl.Size = UDim2.new(1, -20, 0, 30)
+TradeDetailLbl.Position = UDim2.new(0, 10, 0, 52)
+TradeDetailLbl.BackgroundTransparency = 1
+TradeDetailLbl.Font = Enum.Font.SourceSans
+TradeDetailLbl.TextSize = 11
+TradeDetailLbl.TextColor3 = Color3.fromRGB(180, 195, 215)
+TradeDetailLbl.TextXAlignment = Enum.TextXAlignment.Left
+TradeDetailLbl.TextWrapped = true
+TradeDetailLbl.Text = "Memantau popup Gift dan sesi Trade..."
+TradeDetailLbl.Parent = TradeStatusCard
+
+local TradeSafetyLbl = Instance.new("TextLabel")
+TradeSafetyLbl.Size = UDim2.new(1, -20, 0, 18)
+TradeSafetyLbl.Position = UDim2.new(0, 10, 0, 84)
+TradeSafetyLbl.BackgroundTransparency = 1
+TradeSafetyLbl.Font = Enum.Font.SourceSansBold
+TradeSafetyLbl.TextSize = 11
+TradeSafetyLbl.TextColor3 = Color3.fromRGB(100, 230, 140)
+TradeSafetyLbl.TextXAlignment = Enum.TextXAlignment.Left
+TradeSafetyLbl.Text = "Proteksi Anti-Scam: AKTIF (Hanya menerima pet, tidak memberi apa-apa)"
+TradeSafetyLbl.Parent = TradeStatusCard
+
+-- Card 2: Pengaturan Syarat & Filter
+local TradeSettingsCard = Instance.new("Frame")
+TradeSettingsCard.Size = UDim2.new(1, 0, 0, 105)
+TradeSettingsCard.Position = UDim2.new(0, 0, 0, 114)
+TradeSettingsCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+TradeSettingsCard.BorderSizePixel = 0
+TradeSettingsCard.Parent = TradePage
+local tsecCorner = Instance.new("UICorner", TradeSettingsCard)
+tsecCorner.CornerRadius = UDim.new(0, 6)
+
+-- Row 1 Pengaturan: Mode Syarat & Filter Pet
+local ModeBtn = Instance.new("TextButton")
+ModeBtn.Size = UDim2.new(0.48, -4, 0, 28)
+ModeBtn.Position = UDim2.new(0, 8, 0, 8)
+ModeBtn.BackgroundColor3 = Color3.fromRGB(40, 75, 110)
+ModeBtn.Font = Enum.Font.SourceSansBold
+ModeBtn.TextSize = 11
+ModeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ModeBtn.Text = "Syarat: 15 Pet / Tas=15"
+ModeBtn.Parent = TradeSettingsCard
+local mbCorner2 = Instance.new("UICorner", ModeBtn)
+mbCorner2.CornerRadius = UDim.new(0, 4)
+
+local modeList = { "Both", "Exact15", "TargetInventory15" }
+local modeNames = {
+    ["Both"] = "Syarat: 15 Pet / Tas=15",
+    ["Exact15"] = "Syarat: 15 Pet Saja",
+    ["TargetInventory15"] = "Syarat: Target Tas=15"
+}
+local currentModeIdx = 1
+
+ModeBtn.MouseButton1Click:Connect(function()
+    currentModeIdx = (currentModeIdx % #modeList) + 1
+    Config.TradeConditionMode = modeList[currentModeIdx]
+    ModeBtn.Text = modeNames[Config.TradeConditionMode]
+end)
+
+local FilterBtn = Instance.new("TextButton")
+FilterBtn.Size = UDim2.new(0.48, -4, 0, 28)
+FilterBtn.Position = UDim2.new(0.52, 0, 0, 8)
+FilterBtn.BackgroundColor3 = Color3.fromRGB(35, 95, 75)
+FilterBtn.Font = Enum.Font.SourceSansBold
+FilterBtn.TextSize = 11
+FilterBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FilterBtn.Text = "Filter: Khusus Tumbal"
+FilterBtn.Parent = TradeSettingsCard
+local fbCorner2 = Instance.new("UICorner", FilterBtn)
+fbCorner2.CornerRadius = UDim.new(0, 4)
+
+FilterBtn.MouseButton1Click:Connect(function()
+    if Config.TradePetFilter == "TumbalOnly" then
+        Config.TradePetFilter = "AllPets"
+        FilterBtn.Text = "Filter: Semua Pet"
+        FilterBtn.BackgroundColor3 = Color3.fromRGB(85, 70, 115)
+    else
+        Config.TradePetFilter = "TumbalOnly"
+        FilterBtn.Text = "Filter: Khusus Tumbal"
+        FilterBtn.BackgroundColor3 = Color3.fromRGB(35, 95, 75)
+    end
+end)
+
+-- Row 2 Pengaturan: Auto Gift Pet & Auto Trade Request
+local AutoGiftBtn = Instance.new("TextButton")
+AutoGiftBtn.Size = UDim2.new(0.48, -4, 0, 28)
+AutoGiftBtn.Position = UDim2.new(0, 8, 0, 40)
+AutoGiftBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+AutoGiftBtn.Font = Enum.Font.SourceSansBold
+AutoGiftBtn.TextSize = 11
+AutoGiftBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoGiftBtn.Text = "Auto Pet Gift: [AKTIF]"
+AutoGiftBtn.Parent = TradeSettingsCard
+local agbCorner = Instance.new("UICorner", AutoGiftBtn)
+agbCorner.CornerRadius = UDim.new(0, 4)
+
+AutoGiftBtn.MouseButton1Click:Connect(function()
+    Config.AutoAcceptPetGift = not Config.AutoAcceptPetGift
+    if Config.AutoAcceptPetGift then
+        AutoGiftBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        AutoGiftBtn.Text = "Auto Pet Gift: [AKTIF]"
+    else
+        AutoGiftBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        AutoGiftBtn.Text = "Auto Pet Gift: [MATI]"
+    end
+end)
+
+local StopFullBtn = Instance.new("TextButton")
+StopFullBtn.Size = UDim2.new(0.48, -4, 0, 28)
+StopFullBtn.Position = UDim2.new(0.52, 0, 0, 40)
+StopFullBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+StopFullBtn.Font = Enum.Font.SourceSansBold
+StopFullBtn.TextSize = 11
+StopFullBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+StopFullBtn.Text = "Jeda Jika Tas=15: [ON]"
+StopFullBtn.Parent = TradeSettingsCard
+local sfbCorner = Instance.new("UICorner", StopFullBtn)
+sfbCorner.CornerRadius = UDim.new(0, 4)
+
+StopFullBtn.MouseButton1Click:Connect(function()
+    Config.TradeStopWhenInventoryFull = not Config.TradeStopWhenInventoryFull
+    if Config.TradeStopWhenInventoryFull then
+        StopFullBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        StopFullBtn.Text = "Jeda Jika Tas=15: [ON]"
+    else
+        StopFullBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        StopFullBtn.Text = "Jeda Jika Tas=15: [OFF]"
+    end
+end)
+
+-- Row 3 Tombol Manual: Force Accept Semua Gift & Force Accept Plaza Trade
+local AcceptAllGiftsBtn = Instance.new("TextButton")
+AcceptAllGiftsBtn.Size = UDim2.new(0.48, -4, 0, 26)
+AcceptAllGiftsBtn.Position = UDim2.new(0, 8, 0, 72)
+AcceptAllGiftsBtn.BackgroundColor3 = Color3.fromRGB(30, 110, 60)
+AcceptAllGiftsBtn.Font = Enum.Font.SourceSansBold
+AcceptAllGiftsBtn.TextSize = 11
+AcceptAllGiftsBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AcceptAllGiftsBtn.Text = "Terima Semua Gift di Layar"
+AcceptAllGiftsBtn.Parent = TradeSettingsCard
+local aagbCorner = Instance.new("UICorner", AcceptAllGiftsBtn)
+aagbCorner.CornerRadius = UDim.new(0, 4)
+
+AcceptAllGiftsBtn.MouseButton1Click:Connect(function()
+    local count = 0
+    pcall(function()
+        local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local giftNotif = pGui and pGui:FindFirstChild("Gift_Notification")
+        local frame = giftNotif and giftNotif:FindFirstChild("Frame")
+        if frame then
+            for _, child in ipairs(frame:GetChildren()) do
+                local holder = child:FindFirstChild("Holder")
+                local acceptBtn = holder and holder:FindFirstChild("Frame") and holder.Frame:FindFirstChild("Accept")
+                if acceptBtn then
+                    TriggerButtonAccept(acceptBtn, child)
+                    count = count + 1
+                end
+            end
+        end
+    end)
+    TradeRuntime.StatusText = string.format("Memproses %d gift di layar!", count)
+    TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+end)
+
+local ForceAcceptBtn = Instance.new("TextButton")
+ForceAcceptBtn.Size = UDim2.new(0.48, -4, 0, 26)
+ForceAcceptBtn.Position = UDim2.new(0.52, 0, 0, 72)
+ForceAcceptBtn.BackgroundColor3 = Color3.fromRGB(40, 75, 110)
+ForceAcceptBtn.Font = Enum.Font.SourceSansBold
+ForceAcceptBtn.TextSize = 11
+ForceAcceptBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ForceAcceptBtn.Text = "Accept Plaza Trade"
+ForceAcceptBtn.Parent = TradeSettingsCard
+local fabCorner = Instance.new("UICorner", ForceAcceptBtn)
+fabCorner.CornerRadius = UDim.new(0, 4)
+
+ForceAcceptBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        if AcceptRemote then AcceptRemote:FireServer() end
+        if TradingController then TradingController:Accept() end
+    end)
+    TradeRuntime.StatusText = "Manual Accept Terkirim!"
+end)
+
+local function UpdateTradeTabUI()
+    TradeStateLbl.Text = "Status: " .. TradeRuntime.StatusText
+    TradeStateLbl.TextColor3 = TradeRuntime.StatusColor
+    TradeDetailLbl.Text = TradeRuntime.DetailText
+
+    if TradeToggleBtn then
+        if Config.AutoTradePet then
+            TradeToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+            TradeToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            TradeToggleBtn.Text = "Auto: [AKTIF]"
+        else
+            TradeToggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+            TradeToggleBtn.TextColor3 = Color3.fromRGB(230, 200, 200)
+            TradeToggleBtn.Text = "Auto: [MATI]"
+        end
+    end
+end
+
+-- ========================================================================================
+-- TAB 3: AUTO FITUR (AUTO ASCEND & AUTO BUY TRADING TICKET)
 -- ========================================================================================
 local AutoPage = TabPages["Auto"]
 
@@ -985,7 +1902,7 @@ local function UpdateAutoTabUI()
 end
 
 -- ========================================================================================
--- TAB 3: DAFTAR PET TUMBAL (DOG, GOLDEN LAB, BUNNY)
+-- TAB 4: DAFTAR PET TUMBAL (DOG, GOLDEN LAB, BUNNY)
 -- ========================================================================================
 local TumbalPage = TabPages["Tumbal"]
 
@@ -1142,7 +2059,7 @@ local function RefreshTumbalListUI()
 end
 
 -- ========================================================================================
--- TAB 4: KANDIDAT SIAP / LOG
+-- TAB 5: KANDIDAT SIAP / LOG
 -- ========================================================================================
 local PreviewPage = TabPages["Preview"]
 
@@ -1243,13 +2160,32 @@ local function RefreshPreviewUI()
 end
 
 -- ========================================================================================
--- 9. BACKGROUND THREAD AUTO REFRESH (0.5 DETIK)
+-- 9. BACKGROUND THREAD AUTO REFRESH (0.3 DETIK)
 -- ========================================================================================
 task.spawn(function()
     while ScreenGui.Parent do
         pcall(function()
+            -- Cek apakah tumbal di tas sudah >= 15, jika ya otomatis matikan toggle Auto Trade
+            local curTumbal, _ = GetTumbalCounts()
+            if curTumbal >= Config.TradeTargetInventoryCount and Config.AutoTradePet then
+                Config.AutoTradePet = false
+                TradeRuntime.StatusText = "Auto Trade MATI (Tas 15/15 Tumbal)"
+                TradeRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+                TradeRuntime.DetailText = string.format("Tas sudah terisi %d/15 pet tumbal! Toggle Auto Trade dimatikan otomatis.", curTumbal)
+                print(string.format("[GAG Auto Trade] Tas mencapai %d/15 tumbal. Toggle Auto Trade otomatis OFF!", curTumbal))
+            end
+
+            -- 1. Auto Accept Popup Gift Pet ("Gift from @player")
+            ProcessPendingPetGifts()
+
+            -- 2. Auto Accept Plaza Trade jika sedang di dalam trade
+            ProcessPlazaTrade()
+
+            -- 3. Update status UI tab aktif
             UpdateSlotCardsUI()
-            if CurrentTab == "Tumbal" then
+            if CurrentTab == "Trade" then
+                UpdateTradeTabUI()
+            elseif CurrentTab == "Tumbal" then
                 RefreshTumbalListUI()
             elseif CurrentTab == "Preview" then
                 RefreshPreviewUI()
@@ -1257,19 +2193,18 @@ task.spawn(function()
                 UpdateAutoTabUI()
             end
 
-            -- Auto Garden Ascension
+            -- 4. Auto Garden Ascension & Auto Buy Trading Ticket
             CheckAndAutoAscend()
-
-            -- Auto Buy Trading Ticket
             CheckAndAutoBuyTradeTicket()
         end)
-        task.wait(0.5)
+        task.wait(0.3)
     end
 end)
 
 -- Inisialisasi Pertama
-SwitchTab("Upgrade")
+SwitchTab("Trade")
 RefreshTumbalListUI()
 UpdateSlotCardsUI()
 UpdateAutoTabUI()
-print("[GAG Upgrader Mobile] Berhasil dimuat untuk Delta Mobile!")
+UpdateTradeTabUI()
+print("[GAG Upgrader Mobile] Berhasil dimuat! Auto Accept Pet Gift & Trade aktif.")
