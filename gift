@@ -1,0 +1,1334 @@
+--[[
+    ========================================================================================
+    GAG (Grow a Garden) - Pet Sender Edition (Delta Mobile Compatible)
+    ----------------------------------------------------------------------------------------
+    SCRIPT KEDUA: KHUSUS PENGIRIM PET TUMBAL KE AKUN TUMBAL / ALT
+    ----------------------------------------------------------------------------------------
+    Fitur Utama:
+    1. Auto Unfavourite Khusus Pet Tumbal:
+       - Jenis: Dog, Bunny, Golden Lab
+       - Umur (Age/Level): >= 75
+       - Base Weight: < 4 KG
+       - Otomatis menghapus status Favorite agar pet bisa ditrade/gift.
+    2. Auto Trade / Gift Pet (15x per Akun):
+       - Mengirim pet tumbal 1-per-1 lewat PetGiftingService.
+       - Delay antar pet 4 - 6 detik (random natural).
+       - Menghitung hingga tepat 15 pet diterima oleh Akun A.
+       - Otomatis beralih ke Akun B (15 pet), lalu ke Akun C (15 pet).
+       - Maksimal 3 akun tujuan dalam 1 server.
+    3. Auto-Teleport / Dekati Target (Opsional / Otomatis):
+       - Berdiri dekat target player (jarak < 5 studs) agar proses gift tidak gagal.
+    4. UI Mobile Sederhana & Ringan:
+       - Tombol Floating [ SENDER MENU ] yang bisa digeser dengan sentuhan layar HP.
+       - Pemilih pemain di server secara instan (Click to Cycle / Input Manual).
+    ========================================================================================
+]]
+
+-- 1. Inisialisasi Service
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- 2. Pembersihan Instance Lama
+if getgenv and getgenv().GAG_PetSender_Gui then
+    pcall(function()
+        getgenv().GAG_PetSender_Gui:Destroy()
+    end)
+    getgenv().GAG_PetSender_Gui = nil
+end
+
+-- Deteksi Container GUI yang Kompatibel dengan Delta Mobile
+local function GetSafeGuiParent()
+    if gethui then
+        local success, hui = pcall(gethui)
+        if success and hui then return hui end
+    end
+    local success, core = pcall(function() return CoreGui end)
+    if success and core then
+        local s, _ = pcall(function()
+            local f = Instance.new("Folder", core)
+            f:Destroy()
+        end)
+        if s then return core end
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- 3. Referensi Remote & Modul Game
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents", 10)
+local PetGiftingServiceRemote = GameEvents and GameEvents:WaitForChild("PetGiftingService", 10)
+local Favorite_ItemRemote = GameEvents and GameEvents:WaitForChild("Favorite_Item", 10)
+local DataServiceModule = ReplicatedStorage:WaitForChild("Modules", 10):WaitForChild("DataService", 10)
+
+-- 4. Konfigurasi Script
+local Config = {
+    -- Filter Pet Tumbal
+    AllowedPetTypes = {
+        ["Dog"] = true,
+        ["Bunny"] = true,
+        ["Golden Lab"] = true
+    },
+    MinAge = 75,
+    MaxBaseWeight = 4.0, -- di bawah 4 KG
+    ProtectMutated = true,
+
+    -- Pengaturan Kirim Pet
+    TargetPetsPerAccount = 15,
+    DelayMin = 4.0,
+    DelayMax = 6.0,
+    AutoTeleport = true,     -- Teleport dekat target jika jarak > 4.5 studs
+    AutoUnfavoriteOnStart = true, -- Otomatis unfavorite saat mulai mengirim
+
+    -- Daftar Akun Target (Maksimal 3 Akun)
+    Targets = {
+        [1] = { Username = "", Sent = 0, Status = "Kosong" },
+        [2] = { Username = "", Sent = 0, Status = "Kosong" },
+        [3] = { Username = "", Sent = 0, Status = "Kosong" }
+    }
+}
+
+local Stats = {
+    TotalUnfavorited = 0,
+    TotalPetsSent = 0
+}
+
+local isSenderRunning = false
+local currentTargetIndex = 1
+local PendingGiftPets = {}
+local LastOutgoingRequestWarning = 0
+
+local SenderRuntime = {
+    StatusText = "Siap. Masukkan akun target lalu klik START.",
+    StatusColor = Color3.fromRGB(180, 195, 215),
+    DetailText = "Belum ada proses pengiriman aktif.",
+    ActiveTargetName = "-",
+    SentInCurrentSession = 0
+}
+
+-- 5. Helper Function Data
+local function GetPlayerData()
+    local success, data = pcall(function()
+        local ds = require(DataServiceModule)
+        return ds:GetData()
+    end)
+    if success and data and data.PetsData then
+        return data
+    end
+    return nil
+end
+
+-- Mencari Tool berdasarkan UUID pet di Backpack atau Character
+local function FindToolByUUID(uuid)
+    if not uuid then return nil end
+
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                local tUuid = item:GetAttribute("PET_UUID") or item:GetAttribute("UUID") or item:GetAttribute("ITEM_UUID")
+                if tUuid == uuid then
+                    return item
+                end
+            end
+        end
+    end
+
+    local character = LocalPlayer.Character
+    if character then
+        for _, item in ipairs(character:GetChildren()) do
+            if item:IsA("Tool") then
+                local tUuid = item:GetAttribute("PET_UUID") or item:GetAttribute("UUID") or item:GetAttribute("ITEM_UUID")
+                if tUuid == uuid then
+                    return item
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Mendapatkan semua pet yang memenuhi syarat tumbal (Dog, Bunny, Golden Lab | Age >= 75 | BW < 4)
+local function GetTumbalCandidatePets()
+    local data = GetPlayerData()
+    if not data or not data.PetsData or not data.PetsData.PetInventory then
+        return {}, {}, {}
+    end
+
+    local invData = data.PetsData.PetInventory.Data or {}
+    local equipped = data.PetsData.EquippedPets or {}
+
+    local allCandidates = {}
+    local favoritedCandidates = {} -- Perlu di-unfavorite
+    local readyCandidates = {}     -- Sudah unfavorite, siap dikirim
+
+    for uuid, petObj in pairs(invData) do
+        local petData = petObj.PetData or {}
+        local petType = petObj.PetType or "Unknown"
+        local level = tonumber(petData.Level) or 0
+        local baseWeight = tonumber(petData.BaseWeight) or 0
+        local isFav = (petData.IsFavorite == true)
+        local isEquipped = table.find(equipped, uuid) ~= nil
+        local isMutated = (petData.Mutation ~= nil and petData.Mutation ~= "")
+
+        -- Filter: Dog, Bunny, Golden Lab
+        if Config.AllowedPetTypes[petType] == true then
+            -- Filter: Umur >= 75 dan Base Weight < 4kg
+            if level >= Config.MinAge and baseWeight < Config.MaxBaseWeight then
+                -- Proteksi: Jangan kirim pet yang sedang dipakai aktif
+                if not isEquipped then
+                    if not (Config.ProtectMutated and isMutated) then
+                        local item = {
+                            UUID = uuid,
+                            PetType = petType,
+                            Level = level,
+                            BaseWeight = baseWeight,
+                            Name = petData.Name or petType,
+                            IsFavorite = isFav,
+                            IsMutated = isMutated,
+                            Raw = petObj
+                        }
+
+                        table.insert(allCandidates, item)
+                        if isFav then
+                            table.insert(favoritedCandidates, item)
+                        else
+                            table.insert(readyCandidates, item)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Urutkan berdasarkan umur terkecil (atau base weight)
+    table.sort(readyCandidates, function(a, b)
+        return a.Level < b.Level
+    end)
+
+    return allCandidates, favoritedCandidates, readyCandidates
+end
+
+-- ========================================================================================
+-- 6. LOGIKA FITUR 1: AUTO UNFAVOURITE PET TUMBAL
+-- ========================================================================================
+local function ExecuteUnfavoriteTumbal(silent)
+    if not Favorite_ItemRemote then
+        if not silent then
+            SenderRuntime.StatusText = "Remote Favorite_Item tidak ditemukan!"
+            SenderRuntime.StatusColor = Color3.fromRGB(255, 80, 80)
+        end
+        return 0
+    end
+
+    local _, favoritedList, _ = GetTumbalCandidatePets()
+    if #favoritedList == 0 then
+        if not silent then
+            SenderRuntime.StatusText = "Tidak ada pet tumbal yang difavoritkan."
+            SenderRuntime.StatusColor = Color3.fromRGB(140, 210, 255)
+            SenderRuntime.DetailText = "Semua pet Dog, Bunny, Golden Lab (Age>=75, BW<4kg) sudah unfavorite."
+        end
+        return 0
+    end
+
+    local count = 0
+    if not silent then
+        SenderRuntime.StatusText = string.format("Memproses Unfavorite %d Pet...", #favoritedList)
+        SenderRuntime.StatusColor = Color3.fromRGB(255, 200, 90)
+    end
+
+    for _, pet in ipairs(favoritedList) do
+        local tool = FindToolByUUID(pet.UUID)
+        if tool then
+            local ok = pcall(function()
+                Favorite_ItemRemote:FireServer(tool)
+            end)
+            if ok then
+                count = count + 1
+                Stats.TotalUnfavorited = Stats.TotalUnfavorited + 1
+            end
+            task.wait(0.1)
+        end
+    end
+
+    if not silent then
+        SenderRuntime.StatusText = string.format("Berhasil Unfavorite %d Pet!", count)
+        SenderRuntime.StatusColor = Color3.fromRGB(100, 255, 140)
+        SenderRuntime.DetailText = string.format("Unfavorite selesai. Pet siap dikirim ke target akun.")
+    end
+
+    return count
+end
+
+-- ========================================================================================
+-- 7. LOGIKA FITUR 2: AUTO TRADE / GIFT PET (15X PER AKUN, GANTI OTOMATIS)
+-- ========================================================================================
+
+-- Helper mencari Player berdasarkan Username / DisplayName di server
+local function FindPlayerByInput(targetInput)
+    if not targetInput or targetInput == "" then return nil end
+    local cleanInput = targetInput:gsub("^@", ""):lower()
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if player.Name:lower() == cleanInput or player.DisplayName:lower() == cleanInput then
+                return player
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Deteksi banner / notifikasi di PlayerGui jika game menampilkan "You already have a outgoing gift request for this pet!"
+local function HasOutgoingGiftNotification()
+    if (os.clock() - LastOutgoingRequestWarning) < 2.0 then
+        return true
+    end
+
+    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pgui then return false end
+
+    for _, desc in ipairs(pgui:GetDescendants()) do
+        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+            local text = desc.Text
+            if text and text ~= "" and text:lower():find("outgoing gift request") then
+                LastOutgoingRequestWarning = os.clock()
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Listener otomatis jika banner notifikasi baru muncul di layar
+pcall(function()
+    local pgui = LocalPlayer:WaitForChild("PlayerGui", 5)
+    if pgui then
+        pgui.DescendantAdded:Connect(function(desc)
+            if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                task.spawn(function()
+                    for _ = 1, 8 do
+                        if not desc.Parent then break end
+                        local txt = desc.Text
+                        if txt and txt:lower():find("outgoing gift request") then
+                            LastOutgoingRequestWarning = os.clock()
+                            break
+                        end
+                        task.wait(0.25)
+                    end
+                end)
+            end
+        end)
+    end
+end)
+
+-- Memeriksa apakah ada pet yang sebelumnya terkirim lalu baru saja di-accept oleh target di background
+local function CheckPendingPetsAccepted(targetIdx, targetCfg)
+    local curData = GetPlayerData()
+    local invData = (curData and curData.PetsData and curData.PetsData.PetInventory and curData.PetsData.PetInventory.Data) or {}
+    local now = os.clock()
+
+    for uuid, info in pairs(PendingGiftPets) do
+        local tool = FindToolByUUID(uuid)
+        local stillInInv = (invData[uuid] ~= nil)
+
+        if not tool and not stillInInv then
+            -- Pet ini telah diterima oleh target!
+            PendingGiftPets[uuid] = nil
+            if info.TargetIdx == targetIdx then
+                targetCfg.Sent = targetCfg.Sent + 1
+                Stats.TotalPetsSent = Stats.TotalPetsSent + 1
+                print(string.format("[GAG Sender] Pet pending (%s) DITERIMA oleh @%s! (Total: %d/15)", 
+                    info.Pet.Name or "Pet", info.TargetPlayer.Name, targetCfg.Sent))
+            end
+        elseif now >= (info.ExpireTime or 0) then
+            -- Request timeout / kadaluarsa di server, hapus dari pending agar bisa dicoba kembali jika perlu
+            PendingGiftPets[uuid] = nil
+        end
+    end
+end
+
+-- Mengirim 1 Pet ke Target Player dengan batas tunggu reaksi (4 - 6 detik)
+local function SendSinglePet(targetPlayer, pet, reactionTimeout)
+    reactionTimeout = reactionTimeout or (math.random(math.floor(Config.DelayMin * 10), math.floor(Config.DelayMax * 10)) / 10)
+
+    if not PetGiftingServiceRemote then
+        return false, "Remote PetGiftingService tidak ada"
+    end
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    if not character or not humanoid or not rootPart then
+        return false, "Karakter pengirim tidak valid"
+    end
+
+    local targetChar = targetPlayer.Character
+    local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    if not targetChar or not targetRoot then
+        return false, string.format("Karakter @%s tidak ditemukan di server", targetPlayer.Name)
+    end
+
+    -- Cek jarak & Auto-teleport jika terlalu jauh (syarat game: < 5 studs)
+    local dist = (targetRoot.Position - rootPart.Position).Magnitude
+    if dist > 4.5 then
+        if Config.AutoTeleport then
+            rootPart.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
+            task.wait(0.2)
+        else
+            return false, string.format("Jarak ke @%s terlalu jauh (%.1f studs > 5). Dekati target!", targetPlayer.Name, dist)
+        end
+    end
+
+    -- Cari tool pet
+    local petTool = FindToolByUUID(pet.UUID)
+    if not petTool then
+        return false, string.format("Tool pet '%s' tidak ditemukan di tas", pet.Name)
+    end
+
+    -- Equip pet tool ke tangan
+    humanoid:UnequipTools()
+    task.wait(0.1)
+    humanoid:EquipTool(petTool)
+    task.wait(0.25)
+
+    -- Reset status deteksi warning sebelum menembak
+    LastOutgoingRequestWarning = 0
+
+    -- Tembak Remote Gift
+    local fireOk = pcall(function()
+        PetGiftingServiceRemote:FireServer("GivePet", targetPlayer)
+    end)
+    if not fireOk then
+        humanoid:UnequipTools()
+        return false, "Gagal menembak remote PetGiftingService"
+    end
+
+    print(string.format("[GAG Sender] Mengirim %s (%s, Age %d, BW %.2f) ke @%s (Tunggu respon max %.1fs)...", 
+        pet.Name, pet.PetType, pet.Level, pet.BaseWeight, targetPlayer.Name, reactionTimeout))
+
+    -- Tunggu hingga pet diterima atau waktu respon (4-6 detik) habis
+    local startTime = os.clock()
+    local isAccepted = false
+    local alreadyPendingOutgoing = false
+
+    while (os.clock() - startTime) < reactionTimeout do
+        if not isSenderRunning then break end
+
+        -- Cek apakah tool sudah hilang dari karakter/tas
+        if not petTool or not petTool.Parent or (petTool.Parent ~= character and petTool.Parent ~= LocalPlayer.Backpack) then
+            isAccepted = true
+            break
+        end
+
+        -- Cek via DataService apakah UUID sudah tidak ada di tas
+        local curData = GetPlayerData()
+        if curData and curData.PetsData and curData.PetsData.PetInventory and curData.PetsData.PetInventory.Data then
+            if not curData.PetsData.PetInventory.Data[pet.UUID] then
+                isAccepted = true
+                break
+            end
+        end
+
+        -- Cek apakah muncul pop-up peringatan "You already have a outgoing gift request for this pet!"
+        if HasOutgoingGiftNotification() then
+            alreadyPendingOutgoing = true
+            break
+        end
+
+        task.wait(0.2)
+    end
+
+    -- Lepas pet dari tangan agar tidak nyangkut memegang pet yang sama
+    humanoid:UnequipTools()
+
+    if isAccepted then
+        return true, "Diterima"
+    elseif alreadyPendingOutgoing then
+        return false, "Sudah ada outgoing gift request untuk pet ini"
+    else
+        return false, string.format("Tidak ada reaksi penerima (%.1fs)", reactionTimeout)
+    end
+end
+
+
+-- ========================================================================================
+-- 8. PEMBUATAN USER INTERFACE KHUSUS MOBILE (SEDERHANA, RINGAN, TANPA ICON)
+-- ========================================================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "GAG_PetSender_" .. math.random(1000, 9999)
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local targetParent = GetSafeGuiParent()
+ScreenGui.Parent = targetParent
+if getgenv then
+    getgenv().GAG_PetSender_Gui = ScreenGui
+end
+
+-- Helper drag universal (Touch & Mouse)
+local function EnableDrag(dragFrame, targetMoveFrame)
+    local isDragging, dragStart, startPos, dragInput = false, nil, nil, nil
+
+    dragFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = true
+            dragStart = input.Position
+            startPos = targetMoveFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    isDragging = false
+                end
+            end)
+        end
+    end)
+
+    dragFrame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and isDragging then
+            local delta = input.Position - dragStart
+            targetMoveFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- Tombol Floating Mobile Toggle
+local FloatBtn = Instance.new("TextButton")
+FloatBtn.Name = "FloatBtn"
+FloatBtn.Size = UDim2.new(0, 105, 0, 32)
+FloatBtn.Position = UDim2.new(0, 15, 0, 90)
+FloatBtn.BackgroundColor3 = Color3.fromRGB(30, 60, 85)
+FloatBtn.Text = "[ SENDER MENU ]"
+FloatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FloatBtn.Font = Enum.Font.SourceSansBold
+FloatBtn.TextSize = 13
+FloatBtn.Parent = ScreenGui
+local fbCorner = Instance.new("UICorner", FloatBtn)
+fbCorner.CornerRadius = UDim.new(0, 8)
+local fbStroke = Instance.new("UIStroke", FloatBtn)
+fbStroke.Color = Color3.fromRGB(70, 150, 210)
+fbStroke.Thickness = 1.5
+
+EnableDrag(FloatBtn, FloatBtn)
+
+-- Main Frame Mobile (Ukuran 480x310)
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 480, 0, 310)
+MainFrame.Position = UDim2.new(0.5, -240, 0.5, -155)
+MainFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Parent = ScreenGui
+
+local mfCorner = Instance.new("UICorner", MainFrame)
+mfCorner.CornerRadius = UDim.new(0, 8)
+local mfStroke = Instance.new("UIStroke", MainFrame)
+mfStroke.Color = Color3.fromRGB(50, 60, 75)
+mfStroke.Thickness = 1.5
+
+FloatBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+end)
+
+-- Top Bar Header
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, 36)
+TopBar.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+local tbCorner = Instance.new("UICorner", TopBar)
+tbCorner.CornerRadius = UDim.new(0, 8)
+
+EnableDrag(TopBar, MainFrame)
+
+local TitleLbl = Instance.new("TextLabel")
+TitleLbl.Size = UDim2.new(1, -70, 1, 0)
+TitleLbl.Position = UDim2.new(0, 10, 0, 0)
+TitleLbl.BackgroundTransparency = 1
+TitleLbl.Font = Enum.Font.SourceSansBold
+TitleLbl.TextSize = 15
+TitleLbl.TextColor3 = Color3.fromRGB(240, 240, 240)
+TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
+TitleLbl.Text = "GAG PET SENDER (Auto Unfav & 15x Trade)"
+TitleLbl.Parent = TopBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 44, 0, 26)
+CloseBtn.Position = UDim2.new(1, -50, 0, 5)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(150, 45, 45)
+CloseBtn.Font = Enum.Font.SourceSansBold
+CloseBtn.TextSize = 13
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Text = "HIDE"
+CloseBtn.Parent = TopBar
+local cbCorner = Instance.new("UICorner", CloseBtn)
+cbCorner.CornerRadius = UDim.new(0, 6)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+end)
+
+-- Navigation Tabs
+local NavFrame = Instance.new("Frame")
+NavFrame.Size = UDim2.new(1, -16, 0, 30)
+NavFrame.Position = UDim2.new(0, 8, 0, 40)
+NavFrame.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
+NavFrame.BorderSizePixel = 0
+NavFrame.Parent = MainFrame
+local nfCorner = Instance.new("UICorner", NavFrame)
+nfCorner.CornerRadius = UDim.new(0, 6)
+
+local TabButtons = {}
+local TabPages = {}
+local CurrentTab = "Kirim"
+
+local TABS = {
+    { Id = "Kirim", Name = "Kirim Pet" },
+    { Id = "Unfav", Name = "Auto Unfav" },
+    { Id = "Daftar", Name = "Daftar Pet" },
+    { Id = "Setting", Name = "Pengaturan" }
+}
+
+local PageContainer = Instance.new("Frame")
+PageContainer.Size = UDim2.new(1, -16, 1, -78)
+PageContainer.Position = UDim2.new(0, 8, 0, 74)
+PageContainer.BackgroundTransparency = 1
+PageContainer.Parent = MainFrame
+
+local function SwitchTab(tabId)
+    CurrentTab = tabId
+    for id, btn in pairs(TabButtons) do
+        if id == tabId then
+            btn.BackgroundColor3 = Color3.fromRGB(45, 65, 100)
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            btn.BackgroundColor3 = Color3.fromRGB(32, 36, 46)
+            btn.TextColor3 = Color3.fromRGB(160, 170, 185)
+        end
+    end
+    for id, page in pairs(TabPages) do
+        page.Visible = (id == tabId)
+    end
+end
+
+local btnWidth = 1 / #TABS
+for i, tabInfo in ipairs(TABS) do
+    local tabBtn = Instance.new("TextButton")
+    tabBtn.Size = UDim2.new(btnWidth, -4, 1, -4)
+    tabBtn.Position = UDim2.new((i - 1) * btnWidth, 2, 0, 2)
+    tabBtn.BackgroundColor3 = Color3.fromRGB(32, 36, 46)
+    tabBtn.Text = tabInfo.Name
+    tabBtn.TextColor3 = Color3.fromRGB(160, 170, 185)
+    tabBtn.Font = Enum.Font.SourceSansBold
+    tabBtn.TextSize = 13
+    tabBtn.Parent = NavFrame
+    local tCorner = Instance.new("UICorner", tabBtn)
+    tCorner.CornerRadius = UDim.new(0, 4)
+
+    tabBtn.MouseButton1Click:Connect(function()
+        SwitchTab(tabInfo.Id)
+    end)
+    TabButtons[tabInfo.Id] = tabBtn
+
+    local page = Instance.new("Frame")
+    page.Name = "Page_" .. tabInfo.Id
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.Parent = PageContainer
+    TabPages[tabInfo.Id] = page
+end
+
+-- ========================================================================================
+-- TAB 1: KIRIM PET (PENGATURAN TARGET AKUN 1, 2, 3 & TOMBOL START)
+-- ========================================================================================
+local KirimPage = TabPages["Kirim"]
+
+local TargetCardsUI = {}
+
+-- Membuat 3 Baris Input Target Akun
+for targetIdx = 1, 3 do
+    local row = Instance.new("Frame")
+    row.Name = "TargetRow_" .. targetIdx
+    row.Size = UDim2.new(1, 0, 0, 36)
+    row.Position = UDim2.new(0, 0, 0, (targetIdx - 1) * 40)
+    row.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+    row.BorderSizePixel = 0
+    row.Parent = KirimPage
+    local rCorner = Instance.new("UICorner", row)
+    rCorner.CornerRadius = UDim.new(0, 6)
+
+    local targetTag = Instance.new("TextLabel")
+    targetTag.Size = UDim2.new(0, 70, 1, 0)
+    targetTag.Position = UDim2.new(0, 8, 0, 0)
+    targetTag.BackgroundTransparency = 1
+    targetTag.Font = Enum.Font.SourceSansBold
+    targetTag.TextSize = 12
+    targetTag.TextColor3 = Color3.fromRGB(255, 215, 90)
+    targetTag.TextXAlignment = Enum.TextXAlignment.Left
+    targetTag.Text = "Akun " .. targetIdx .. ":"
+    targetTag.Parent = row
+
+    local userBox = Instance.new("TextBox")
+    userBox.Size = UDim2.new(0, 150, 0, 26)
+    userBox.Position = UDim2.new(0, 78, 0, 5)
+    userBox.BackgroundColor3 = Color3.fromRGB(36, 42, 54)
+    userBox.BorderSizePixel = 0
+    userBox.Font = Enum.Font.SourceSansBold
+    userBox.TextSize = 12
+    userBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    userBox.PlaceholderColor3 = Color3.fromRGB(140, 150, 165)
+    userBox.PlaceholderText = "Username Akun " .. targetIdx
+    userBox.Text = Config.Targets[targetIdx].Username
+    userBox.ClearTextOnFocus = false
+    userBox.Parent = row
+    local ubCorner = Instance.new("UICorner", userBox)
+    ubCorner.CornerRadius = UDim.new(0, 4)
+
+    userBox.FocusLost:Connect(function()
+        Config.Targets[targetIdx].Username = userBox.Text:gsub("^@", ""):gsub("%s+", "")
+    end)
+
+    -- Tombol Pilih Player di Server (Cycle)
+    local pickBtn = Instance.new("TextButton")
+    pickBtn.Size = UDim2.new(0, 85, 0, 26)
+    pickBtn.Position = UDim2.new(0, 234, 0, 5)
+    pickBtn.BackgroundColor3 = Color3.fromRGB(40, 70, 95)
+    pickBtn.Font = Enum.Font.SourceSansBold
+    pickBtn.TextSize = 11
+    pickBtn.TextColor3 = Color3.fromRGB(220, 235, 255)
+    pickBtn.Text = "Pilih Player"
+    pickBtn.Parent = row
+    local pbCorner = Instance.new("UICorner", pickBtn)
+    pbCorner.CornerRadius = UDim.new(0, 4)
+
+    local currentPlrCycle = 1
+    pickBtn.MouseButton1Click:Connect(function()
+        local serverPlrs = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then
+                table.insert(serverPlrs, p.Name)
+            end
+        end
+
+        if #serverPlrs == 0 then
+            userBox.Text = "Tidak ada player"
+            return
+        end
+
+        currentPlrCycle = (currentPlrCycle % #serverPlrs) + 1
+        local selectedName = serverPlrs[currentPlrCycle]
+        userBox.Text = selectedName
+        Config.Targets[targetIdx].Username = selectedName
+    end)
+
+    local progressLbl = Instance.new("TextLabel")
+    progressLbl.Size = UDim2.new(1, -330, 1, 0)
+    progressLbl.Position = UDim2.new(0, 325, 0, 0)
+    progressLbl.BackgroundTransparency = 1
+    progressLbl.Font = Enum.Font.SourceSansBold
+    progressLbl.TextSize = 12
+    progressLbl.TextColor3 = Color3.fromRGB(130, 230, 160)
+    progressLbl.TextXAlignment = Enum.TextXAlignment.Right
+    progressLbl.Text = "0 / 15 (Menunggu)"
+    progressLbl.Parent = row
+
+    TargetCardsUI[targetIdx] = {
+        UserBox = userBox,
+        ProgressLbl = progressLbl
+    }
+end
+
+-- Panel Kontrol Bawah (Tombol Start & Info Status)
+local SenderControlPanel = Instance.new("Frame")
+SenderControlPanel.Size = UDim2.new(1, 0, 0, 95)
+SenderControlPanel.Position = UDim2.new(0, 0, 0, 124)
+SenderControlPanel.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+SenderControlPanel.BorderSizePixel = 0
+SenderControlPanel.Parent = KirimPage
+local scpCorner = Instance.new("UICorner", SenderControlPanel)
+scpCorner.CornerRadius = UDim.new(0, 8)
+
+local StartSenderBtn = Instance.new("TextButton")
+StartSenderBtn.Size = UDim2.new(1, -16, 0, 42)
+StartSenderBtn.Position = UDim2.new(0, 8, 0, 8)
+StartSenderBtn.BackgroundColor3 = Color3.fromRGB(35, 140, 70)
+StartSenderBtn.Font = Enum.Font.SourceSansBold
+StartSenderBtn.TextSize = 15
+StartSenderBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+StartSenderBtn.Text = "MULAI AUTO KIRIM 15 PET (START)"
+StartSenderBtn.Parent = SenderControlPanel
+local ssbCorner = Instance.new("UICorner", StartSenderBtn)
+ssbCorner.CornerRadius = UDim.new(0, 6)
+
+local SenderStatusLbl = Instance.new("TextLabel")
+SenderStatusLbl.Size = UDim2.new(1, -16, 0, 20)
+SenderStatusLbl.Position = UDim2.new(0, 8, 0, 54)
+SenderStatusLbl.BackgroundTransparency = 1
+SenderStatusLbl.Font = Enum.Font.SourceSansBold
+SenderStatusLbl.TextSize = 12
+SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 220, 100)
+SenderStatusLbl.TextXAlignment = Enum.TextXAlignment.Left
+SenderStatusLbl.Text = "Status: Siap mengirim pet tumbal."
+SenderStatusLbl.Parent = SenderControlPanel
+
+local SenderDetailLbl = Instance.new("TextLabel")
+SenderDetailLbl.Size = UDim2.new(1, -16, 0, 16)
+SenderDetailLbl.Position = UDim2.new(0, 8, 0, 74)
+SenderDetailLbl.BackgroundTransparency = 1
+SenderDetailLbl.Font = Enum.Font.SourceSans
+SenderDetailLbl.TextSize = 11
+SenderDetailLbl.TextColor3 = Color3.fromRGB(170, 185, 205)
+SenderDetailLbl.TextXAlignment = Enum.TextXAlignment.Left
+SenderDetailLbl.Text = "Aturan: Dog, Bunny, Golden Lab | Age >= 75 | Base Weight < 4kg | Delay 4-6s"
+SenderDetailLbl.Parent = SenderControlPanel
+
+-- Eksekusi Thread Pengiriman Pet Berantai (Target 1 -> Target 2 -> Target 3)
+StartSenderBtn.MouseButton1Click:Connect(function()
+    if isSenderRunning then
+        isSenderRunning = false
+        StartSenderBtn.Text = "MULAI AUTO KIRIM 15 PET (START)"
+        StartSenderBtn.BackgroundColor3 = Color3.fromRGB(35, 140, 70)
+        SenderStatusLbl.Text = "Pengiriman dihentikan oleh pengguna."
+        SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 140, 140)
+        return
+    end
+
+    -- Validasi target accounts
+    local hasAnyTarget = false
+    for i = 1, 3 do
+        local uName = Config.Targets[i].Username:gsub("%s+", "")
+        if uName ~= "" then
+            hasAnyTarget = true
+            break
+        end
+    end
+
+    if not hasAnyTarget then
+        SenderStatusLbl.Text = "Peringatan: Masukkan minimal 1 username akun target!"
+        SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 100, 100)
+        return
+    end
+
+    isSenderRunning = true
+    StartSenderBtn.Text = "BERHENTIKAN PENGIRIMAN [STOP]"
+    StartSenderBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+
+    task.spawn(function()
+        -- 1. Auto Unfavorite awal sebelum kirim jika diaktifkan
+        if Config.AutoUnfavoriteOnStart then
+            SenderStatusLbl.Text = "Auto Unfavorite pet tumbal yang memenuhi syarat..."
+            SenderStatusLbl.TextColor3 = Color3.fromRGB(130, 215, 255)
+            ExecuteUnfavoriteTumbal(true)
+            task.wait(0.5)
+        end
+
+        for targetIdx = 1, 3 do
+            if not isSenderRunning then break end
+
+            local targetCfg = Config.Targets[targetIdx]
+            local targetName = targetCfg.Username:gsub("%s+", "")
+
+            if targetName ~= "" then
+                currentTargetIndex = targetIdx
+                local targetPlayer = FindPlayerByInput(targetName)
+
+                if not targetPlayer then
+                    SenderStatusLbl.Text = string.format("Akun %d (@%s) TIDAK DITEMUKAN di server! Melewati...", targetIdx, targetName)
+                    SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 120, 100)
+                    targetCfg.Status = "Tidak Online"
+                    task.wait(2)
+                else
+                    targetCfg.Status = "Sedang Dikirim"
+                    SenderStatusLbl.Text = string.format("Mengirim ke Akun %d: @%s (Target: 15 Pet)...", targetIdx, targetPlayer.Name)
+                    SenderStatusLbl.TextColor3 = Color3.fromRGB(100, 220, 255)
+
+                    local petCandidateIndex = 1
+
+                    while isSenderRunning and targetCfg.Sent < Config.TargetPetsPerAccount do
+                        -- 1. Cek apakah ada pet yang sebelumnya terkirim lalu baru saja di-accept di background
+                        CheckPendingPetsAccepted(targetIdx, targetCfg)
+                        if targetCfg.Sent >= Config.TargetPetsPerAccount then
+                            break
+                        end
+
+                        -- 2. Cari kandidat pet yang siap dikirim (sudah unfavorite)
+                        local _, favoritedList, readyList = GetTumbalCandidatePets()
+
+                        -- Jika masih ada pet yang difavoritkan, unfavorite dulu
+                        if #readyList == 0 and #favoritedList > 0 then
+                            SenderStatusLbl.Text = string.format("Unfavorite %d pet tumbal tambahan...", #favoritedList)
+                            ExecuteUnfavoriteTumbal(true)
+                            task.wait(0.5)
+                            _, _, readyList = GetTumbalCandidatePets()
+                        end
+
+                        -- 3. Filter pet yang TIDAK sedang ada pending outgoing request
+                        local availablePets = {}
+                        local now = os.clock()
+                        for _, pet in ipairs(readyList) do
+                            local pending = PendingGiftPets[pet.UUID]
+                            if not pending or now >= (pending.ExpireTime or 0) then
+                                table.insert(availablePets, pet)
+                            end
+                        end
+
+                        if #availablePets == 0 then
+                            if #readyList > 0 then
+                                -- Semua pet tumbal di tas sedang pending request ke target
+                                SenderStatusLbl.Text = string.format("Menunggu reaksi @%s (%d pet sedang pending)...", targetPlayer.Name, #readyList)
+                                SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 215, 100)
+                                SenderDetailLbl.Text = "Semua pet telah dikirim request. Menunggu konfirmasi penerima..."
+                                task.wait(2.0)
+                                CheckPendingPetsAccepted(targetIdx, targetCfg)
+                            else
+                                SenderStatusLbl.Text = "Stok pet tumbal habis (Dog/Bunny/Lab, Age>=75, BW<4kg)!"
+                                SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 120, 100)
+                                isSenderRunning = false
+                                break
+                            end
+                        else
+                            -- Rotasi pemilihan pet agar selalu mengirim pet yang BERBEDA!
+                            if petCandidateIndex > #availablePets then
+                                petCandidateIndex = 1
+                            end
+                            local petToSend = availablePets[petCandidateIndex]
+
+                            local nextPetNum = targetCfg.Sent + 1
+                            -- Waktu tunggu reaksi penerima 4 - 6 detik sesuai permintaan user
+                            local reactionWait = math.random(math.floor(Config.DelayMin * 10), math.floor(Config.DelayMax * 10)) / 10
+
+                            SenderStatusLbl.Text = string.format("[Akun %d: %d/15] Request pet %s (Age %d, BW %.1f) ke @%s...", 
+                                targetIdx, nextPetNum, petToSend.PetType, petToSend.Level, petToSend.BaseWeight, targetPlayer.Name)
+                            SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 215, 100)
+                            SenderDetailLbl.Text = string.format("Menunggu respon penerima %.1f detik...", reactionWait)
+
+                            local success, msg = SendSinglePet(targetPlayer, petToSend, reactionWait)
+
+                            -- Cek kembali apakah ada pet pending yang diterima
+                            CheckPendingPetsAccepted(targetIdx, targetCfg)
+
+                            if success then
+                                targetCfg.Sent = targetCfg.Sent + 1
+                                Stats.TotalPetsSent = Stats.TotalPetsSent + 1
+                                PendingGiftPets[petToSend.UUID] = nil
+
+                                SenderStatusLbl.Text = string.format("[Akun %d: %d/15] Pet DITERIMA oleh @%s!", 
+                                    targetIdx, targetCfg.Sent, targetPlayer.Name)
+                                SenderStatusLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
+
+                                -- Delay antar pet 4 - 6 detik setelah diterima
+                                if targetCfg.Sent < Config.TargetPetsPerAccount then
+                                    local postDelay = math.random(math.floor(Config.DelayMin * 10), math.floor(Config.DelayMax * 10)) / 10
+                                    SenderDetailLbl.Text = string.format("Jeda %.1fs sebelum mengambil pet ke-%d...", postDelay, targetCfg.Sent + 1)
+                                    task.wait(postDelay)
+                                end
+                            else
+                                -- Tidak ada reaksi dalam 4-6 detik ATAU ada outgoing request
+                                -- Tandai pet ini di PendingGiftPets agar TIDAK diulang / spam pet yang sama!
+                                PendingGiftPets[petToSend.UUID] = {
+                                    TargetPlayer = targetPlayer,
+                                    TargetIdx = targetIdx,
+                                    SentTime = os.clock(),
+                                    ExpireTime = os.clock() + 45, -- cooldown 45s
+                                    Pet = petToSend
+                                }
+
+                                -- Geser ke pet BERIKUTNYA agar mengirim pet yang berbeda!
+                                petCandidateIndex = petCandidateIndex + 1
+
+                                SenderStatusLbl.Text = string.format("[%s] Beralih ke pet berbeda...", msg)
+                                SenderStatusLbl.TextColor3 = Color3.fromRGB(255, 160, 80)
+                                SenderDetailLbl.Text = string.format("Pet '%s' tidak direspon dalam %.1fs. Mengganti pet tumbal lain.", petToSend.Name, reactionWait)
+
+                                task.wait(0.5)
+                            end
+                        end
+                    end
+
+                    if targetCfg.Sent >= Config.TargetPetsPerAccount then
+                        targetCfg.Status = "Selesai (15/15)"
+                        SenderStatusLbl.Text = string.format("AKUN %d (@%s) SELESAI MENERIMA 15 PET!", targetIdx, targetPlayer.Name)
+                        SenderStatusLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
+                        task.wait(2.0)
+                    end
+                end
+            end
+        end
+
+        isSenderRunning = false
+        StartSenderBtn.Text = "MULAI AUTO KIRIM 15 PET (START)"
+        StartSenderBtn.BackgroundColor3 = Color3.fromRGB(35, 140, 70)
+
+        local allDone = true
+        for i = 1, 3 do
+            if Config.Targets[i].Username ~= "" and Config.Targets[i].Sent < Config.TargetPetsPerAccount then
+                allDone = false
+            end
+        end
+
+        if allDone then
+            SenderStatusLbl.Text = "SEMUA AKUN TARGET TELAH SELESAI (15 Pet Tiap Akun)!"
+            SenderStatusLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
+        else
+            SenderStatusLbl.Text = "Proses selesai atau dihentikan."
+        end
+    end)
+end)
+
+local function UpdateKirimTabUI()
+    for idx = 1, 3 do
+        local ui = TargetCardsUI[idx]
+        local cfg = Config.Targets[idx]
+        if ui and cfg then
+            if cfg.Username == "" then
+                ui.ProgressLbl.Text = "Belum Diatur"
+                ui.ProgressLbl.TextColor3 = Color3.fromRGB(130, 140, 155)
+            elseif cfg.Sent >= Config.TargetPetsPerAccount then
+                ui.ProgressLbl.Text = "15 / 15 (Selesai)"
+                ui.ProgressLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
+            elseif isSenderRunning and currentTargetIndex == idx then
+                ui.ProgressLbl.Text = string.format("%d / 15 (Sedang Kirim)", cfg.Sent)
+                ui.ProgressLbl.TextColor3 = Color3.fromRGB(255, 215, 100)
+            else
+                ui.ProgressLbl.Text = string.format("%d / 15 (%s)", cfg.Sent, cfg.Status)
+                ui.ProgressLbl.TextColor3 = Color3.fromRGB(180, 200, 220)
+            end
+        end
+    end
+end
+
+-- ========================================================================================
+-- TAB 2: AUTO UNFAVOURITE
+-- ========================================================================================
+local UnfavPage = TabPages["Unfav"]
+
+local UnfavCard = Instance.new("Frame")
+UnfavCard.Size = UDim2.new(1, 0, 0, 110)
+UnfavCard.Position = UDim2.new(0, 0, 0, 0)
+UnfavCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+UnfavCard.BorderSizePixel = 0
+UnfavCard.Parent = UnfavPage
+local ucCorner = Instance.new("UICorner", UnfavCard)
+ucCorner.CornerRadius = UDim.new(0, 6)
+
+local ucTitle = Instance.new("TextLabel")
+ucTitle.Size = UDim2.new(1, -20, 0, 24)
+ucTitle.Position = UDim2.new(0, 10, 0, 4)
+ucTitle.BackgroundTransparency = 1
+ucTitle.Font = Enum.Font.SourceSansBold
+ucTitle.TextSize = 14
+ucTitle.TextColor3 = Color3.fromRGB(240, 240, 240)
+ucTitle.TextXAlignment = Enum.TextXAlignment.Left
+ucTitle.Text = "Filter Khusus Auto Unfavourite Tumbal"
+ucTitle.Parent = UnfavCard
+
+local ucDesc = Instance.new("TextLabel")
+ucDesc.Size = UDim2.new(1, -20, 0, 36)
+ucDesc.Position = UDim2.new(0, 10, 0, 28)
+ucDesc.BackgroundTransparency = 1
+ucDesc.Font = Enum.Font.SourceSans
+ucDesc.TextSize = 12
+ucDesc.TextColor3 = Color3.fromRGB(180, 195, 215)
+ucDesc.TextXAlignment = Enum.TextXAlignment.Left
+ucDesc.TextWrapped = true
+ucDesc.Text = "Hanya pet Dog, Bunny, Golden Lab dengan Umur >= 75 dan Base Weight < 4.0 KG yang akan di-unfavorite secara otomatis."
+ucDesc.Parent = UnfavCard
+
+local UnfavCountLbl = Instance.new("TextLabel")
+UnfavCountLbl.Size = UDim2.new(1, -20, 0, 20)
+UnfavCountLbl.Position = UDim2.new(0, 10, 0, 68)
+UnfavCountLbl.BackgroundTransparency = 1
+UnfavCountLbl.Font = Enum.Font.SourceSansBold
+UnfavCountLbl.TextSize = 12
+UnfavCountLbl.TextColor3 = Color3.fromRGB(255, 215, 100)
+UnfavCountLbl.TextXAlignment = Enum.TextXAlignment.Left
+UnfavCountLbl.Text = "Perlu Unfavorite: 0 Pet | Siap Kirim: 0 Pet"
+UnfavCountLbl.Parent = UnfavCard
+
+-- Tombol Eksekusi Manual Unfavorite
+local ExecUnfavBtn = Instance.new("TextButton")
+ExecUnfavBtn.Size = UDim2.new(1, 0, 0, 40)
+ExecUnfavBtn.Position = UDim2.new(0, 0, 0, 118)
+ExecUnfavBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 70)
+ExecUnfavBtn.Font = Enum.Font.SourceSansBold
+ExecUnfavBtn.TextSize = 13
+ExecUnfavBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ExecUnfavBtn.Text = "UNFAVOURITE SEMUA PET TUMBAL SEKARANG"
+ExecUnfavBtn.Parent = UnfavPage
+local eubCorner = Instance.new("UICorner", ExecUnfavBtn)
+eubCorner.CornerRadius = UDim.new(0, 6)
+
+ExecUnfavBtn.MouseButton1Click:Connect(function()
+    ExecUnfavBtn.Text = "Memproses Unfavorite..."
+    ExecUnfavBtn.BackgroundColor3 = Color3.fromRGB(180, 110, 30)
+
+    task.spawn(function()
+        local done = ExecuteUnfavoriteTumbal(false)
+        ExecUnfavBtn.Text = string.format("SELESAI (%d Pet Di-Unfavorite)", done)
+        ExecUnfavBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 70)
+        task.wait(2)
+        ExecUnfavBtn.Text = "UNFAVOURITE SEMUA PET TUMBAL SEKARANG"
+    end)
+end)
+
+local AutoUnfavToggleBtn = Instance.new("TextButton")
+AutoUnfavToggleBtn.Size = UDim2.new(1, 0, 0, 36)
+AutoUnfavToggleBtn.Position = UDim2.new(0, 0, 0, 166)
+AutoUnfavToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 75, 110)
+AutoUnfavToggleBtn.Font = Enum.Font.SourceSansBold
+AutoUnfavToggleBtn.TextSize = 12
+AutoUnfavToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoUnfavToggleBtn.Text = "Auto Unfavorite Saat Kirim: [AKTIF]"
+AutoUnfavToggleBtn.Parent = UnfavPage
+local autbCorner = Instance.new("UICorner", AutoUnfavToggleBtn)
+autbCorner.CornerRadius = UDim.new(0, 6)
+
+AutoUnfavToggleBtn.MouseButton1Click:Connect(function()
+    Config.AutoUnfavoriteOnStart = not Config.AutoUnfavoriteOnStart
+    if Config.AutoUnfavoriteOnStart then
+        AutoUnfavToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 75, 110)
+        AutoUnfavToggleBtn.Text = "Auto Unfavorite Saat Kirim: [AKTIF]"
+    else
+        AutoUnfavToggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        AutoUnfavToggleBtn.Text = "Auto Unfavorite Saat Kirim: [MATI]"
+    end
+end)
+
+local function UpdateUnfavTabUI()
+    local _, favList, readyList = GetTumbalCandidatePets()
+    UnfavCountLbl.Text = string.format("Perlu Unfavorite: %d Pet | Siap Kirim: %d Pet (Total Unfavorited: %d)", 
+        #favList, #readyList, Stats.TotalUnfavorited)
+end
+
+-- ========================================================================================
+-- TAB 3: DAFTAR PET TUMBAL SIAP KIRIM
+-- ========================================================================================
+local DaftarPage = TabPages["Daftar"]
+
+local DaftarHeader = Instance.new("TextLabel")
+DaftarHeader.Size = UDim2.new(1, 0, 0, 20)
+DaftarHeader.BackgroundTransparency = 1
+DaftarHeader.Font = Enum.Font.SourceSansBold
+DaftarHeader.TextSize = 13
+DaftarHeader.TextColor3 = Color3.fromRGB(255, 215, 90)
+DaftarHeader.TextXAlignment = Enum.TextXAlignment.Left
+DaftarHeader.Text = "Daftar Pet Tumbal di Tas (Dog, Bunny, Golden Lab):"
+DaftarHeader.Parent = DaftarPage
+
+local DaftarScroll = Instance.new("ScrollingFrame")
+DaftarScroll.Size = UDim2.new(1, 0, 1, -26)
+DaftarScroll.Position = UDim2.new(0, 0, 0, 24)
+DaftarScroll.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
+DaftarScroll.BorderSizePixel = 0
+DaftarScroll.ScrollBarThickness = 5
+DaftarScroll.Parent = DaftarPage
+local dsCorner = Instance.new("UICorner", DaftarScroll)
+dsCorner.CornerRadius = UDim.new(0, 6)
+
+local DaftarLayout = Instance.new("UIListLayout")
+DaftarLayout.Padding = UDim.new(0, 3)
+DaftarLayout.Parent = DaftarScroll
+
+local function RefreshDaftarUI()
+    for _, child in ipairs(DaftarScroll:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    local allCandidates, _, _ = GetTumbalCandidatePets()
+    if not allCandidates or #allCandidates == 0 then
+        local emptyLbl = Instance.new("TextLabel")
+        emptyLbl.Size = UDim2.new(1, 0, 0, 40)
+        emptyLbl.BackgroundTransparency = 1
+        emptyLbl.Font = Enum.Font.SourceSans
+        emptyLbl.TextSize = 12
+        emptyLbl.TextColor3 = Color3.fromRGB(150, 160, 175)
+        emptyLbl.Text = "Tidak ada pet yang memenuhi syarat (Dog/Bunny/Lab, Age>=75, BW<4kg)."
+        emptyLbl.Parent = DaftarScroll
+        DaftarScroll.CanvasSize = UDim2.new(0, 0, 0, 50)
+        return
+    end
+
+    for i, pet in ipairs(allCandidates) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -6, 0, 28)
+        row.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(28, 32, 42) or Color3.fromRGB(32, 36, 48)
+        row.BorderSizePixel = 0
+        row.Parent = DaftarScroll
+        local rCorner = Instance.new("UICorner", row)
+        rCorner.CornerRadius = UDim.new(0, 4)
+
+        local pName = Instance.new("TextLabel")
+        pName.Size = UDim2.new(0.32, 0, 1, 0)
+        pName.Position = UDim2.new(0, 8, 0, 0)
+        pName.BackgroundTransparency = 1
+        pName.Font = Enum.Font.SourceSansBold
+        pName.TextSize = 12
+        pName.TextColor3 = Color3.fromRGB(240, 240, 240)
+        pName.TextXAlignment = Enum.TextXAlignment.Left
+        pName.Text = string.format("%d. %s", i, pet.PetType)
+        pName.Parent = row
+
+        local pAge = Instance.new("TextLabel")
+        pAge.Size = UDim2.new(0.20, 0, 1, 0)
+        pAge.Position = UDim2.new(0.33, 0, 0, 0)
+        pAge.BackgroundTransparency = 1
+        pAge.Font = Enum.Font.SourceSans
+        pAge.TextSize = 12
+        pAge.TextColor3 = Color3.fromRGB(255, 215, 0)
+        pAge.TextXAlignment = Enum.TextXAlignment.Left
+        pAge.Text = "Age: " .. pet.Level
+        pAge.Parent = row
+
+        local pWeight = Instance.new("TextLabel")
+        pWeight.Size = UDim2.new(0.25, 0, 1, 0)
+        pWeight.Position = UDim2.new(0.53, 0, 0, 0)
+        pWeight.BackgroundTransparency = 1
+        pWeight.Font = Enum.Font.SourceSans
+        pWeight.TextSize = 11
+        pWeight.TextColor3 = Color3.fromRGB(140, 210, 255)
+        pWeight.TextXAlignment = Enum.TextXAlignment.Left
+        pWeight.Text = string.format("BW: %.2f KG", pet.BaseWeight)
+        pWeight.Parent = row
+
+        local pStatus = Instance.new("TextLabel")
+        pStatus.Size = UDim2.new(0.22, 0, 1, 0)
+        pStatus.Position = UDim2.new(0.77, 0, 0, 0)
+        pStatus.BackgroundTransparency = 1
+        pStatus.Font = Enum.Font.SourceSansBold
+        pStatus.TextSize = 11
+        pStatus.TextXAlignment = Enum.TextXAlignment.Right
+
+        if pet.IsFavorite then
+            pStatus.TextColor3 = Color3.fromRGB(255, 140, 100)
+            pStatus.Text = "[Favorite]"
+        else
+            pStatus.TextColor3 = Color3.fromRGB(100, 255, 140)
+            pStatus.Text = "[Siap Kirim]"
+        end
+        pStatus.Parent = row
+    end
+
+    DaftarScroll.CanvasSize = UDim2.new(0, 0, 0, #allCandidates * 32 + 10)
+end
+
+-- ========================================================================================
+-- TAB 4: PENGATURAN
+-- ========================================================================================
+local SettingPage = TabPages["Setting"]
+
+local TeleportToggleBtn = Instance.new("TextButton")
+TeleportToggleBtn.Size = UDim2.new(1, 0, 0, 36)
+TeleportToggleBtn.Position = UDim2.new(0, 0, 0, 10)
+TeleportToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+TeleportToggleBtn.Font = Enum.Font.SourceSansBold
+TeleportToggleBtn.TextSize = 12
+TeleportToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+TeleportToggleBtn.Text = "Auto Teleport ke Target: [AKTIF]"
+TeleportToggleBtn.Parent = SettingPage
+local ttbCorner = Instance.new("UICorner", TeleportToggleBtn)
+ttbCorner.CornerRadius = UDim.new(0, 6)
+
+TeleportToggleBtn.MouseButton1Click:Connect(function()
+    Config.AutoTeleport = not Config.AutoTeleport
+    if Config.AutoTeleport then
+        TeleportToggleBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        TeleportToggleBtn.Text = "Auto Teleport ke Target: [AKTIF]"
+    else
+        TeleportToggleBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        TeleportToggleBtn.Text = "Auto Teleport ke Target: [MATI]"
+    end
+end)
+
+local DelayInfoCard = Instance.new("Frame")
+DelayInfoCard.Size = UDim2.new(1, 0, 0, 75)
+DelayInfoCard.Position = UDim2.new(0, 0, 0, 56)
+DelayInfoCard.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+DelayInfoCard.BorderSizePixel = 0
+DelayInfoCard.Parent = SettingPage
+local dicCorner = Instance.new("UICorner", DelayInfoCard)
+dicCorner.CornerRadius = UDim.new(0, 6)
+
+local dicTitle = Instance.new("TextLabel")
+dicTitle.Size = UDim2.new(1, -20, 0, 22)
+dicTitle.Position = UDim2.new(0, 10, 0, 6)
+dicTitle.BackgroundTransparency = 1
+dicTitle.Font = Enum.Font.SourceSansBold
+dicTitle.TextSize = 13
+dicTitle.TextColor3 = Color3.fromRGB(255, 215, 90)
+dicTitle.TextXAlignment = Enum.TextXAlignment.Left
+dicTitle.Text = "Delay Antar Pet: 4 - 6 Detik"
+dicTitle.Parent = DelayInfoCard
+
+local dicBody = Instance.new("TextLabel")
+dicBody.Size = UDim2.new(1, -20, 0, 40)
+dicBody.Position = UDim2.new(0, 10, 0, 28)
+dicBody.BackgroundTransparency = 1
+dicBody.Font = Enum.Font.SourceSans
+dicBody.TextSize = 11
+dicBody.TextColor3 = Color3.fromRGB(175, 190, 210)
+dicBody.TextXAlignment = Enum.TextXAlignment.Left
+dicBody.TextWrapped = true
+dicBody.Text = "Delay natural 4-6 detik dihitung secara acak setelah pet sebelumnya diterima oleh akun target agar aman dan anti-kick."
+dicBody.Parent = DelayInfoCard
+
+local MutProtectBtn = Instance.new("TextButton")
+MutProtectBtn.Size = UDim2.new(1, 0, 0, 36)
+MutProtectBtn.Position = UDim2.new(0, 0, 0, 140)
+MutProtectBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+MutProtectBtn.Font = Enum.Font.SourceSansBold
+MutProtectBtn.TextSize = 12
+MutProtectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MutProtectBtn.Text = "Proteksi Pet Mutasi: [AKTIF]"
+MutProtectBtn.Parent = SettingPage
+local mpbCorner = Instance.new("UICorner", MutProtectBtn)
+mpbCorner.CornerRadius = UDim.new(0, 6)
+
+MutProtectBtn.MouseButton1Click:Connect(function()
+    Config.ProtectMutated = not Config.ProtectMutated
+    if Config.ProtectMutated then
+        MutProtectBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+        MutProtectBtn.Text = "Proteksi Pet Mutasi: [AKTIF]"
+    else
+        MutProtectBtn.BackgroundColor3 = Color3.fromRGB(110, 45, 45)
+        MutProtectBtn.Text = "Proteksi Pet Mutasi: [MATI]"
+    end
+end)
+
+-- ========================================================================================
+-- 9. BACKGROUND REFRESH THREAD (0.5 DETIK)
+-- ========================================================================================
+task.spawn(function()
+    while ScreenGui.Parent do
+        pcall(function()
+            if CurrentTab == "Kirim" then
+                UpdateKirimTabUI()
+            elseif CurrentTab == "Unfav" then
+                UpdateUnfavTabUI()
+            elseif CurrentTab == "Daftar" then
+                RefreshDaftarUI()
+            end
+        end)
+        task.wait(0.5)
+    end
+end)
+
+-- Inisialisasi Awal
+SwitchTab("Kirim")
+UpdateKirimTabUI()
+UpdateUnfavTabUI()
+print("[GAG Pet Sender] Berhasil dimuat! Siap mengirim 15x pet tumbal ke hingga 3 akun target.")
