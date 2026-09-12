@@ -1417,3 +1417,4 @@ SwitchTab("Kirim")
 UpdateKirimTabUI()
 UpdateUnfavTabUI()
 print("[GAG Pet Sender] Berhasil dimuat! Siap mengirim 15x pet tumbal ke hingga 3 akun target.")
+
