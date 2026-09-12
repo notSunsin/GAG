@@ -523,11 +523,11 @@ fbStroke.Thickness = 1.5
 
 EnableDrag(FloatBtn, FloatBtn)
 
--- Main Frame Mobile (Ukuran 480x310)
+-- Main Frame Mobile (Ukuran 500x315)
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 480, 0, 310)
-MainFrame.Position = UDim2.new(0.5, -240, 0.5, -155)
+MainFrame.Size = UDim2.new(0, 500, 0, 315)
+MainFrame.Position = UDim2.new(0.5, -250, 0.5, -157)
 MainFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
@@ -658,6 +658,7 @@ end
 -- ========================================================================================
 local KirimPage = TabPages["Kirim"]
 
+local UpdateKirimTabUI -- forward declaration
 local TargetCardsUI = {}
 
 -- Membuat 3 Baris Input Target Akun
@@ -673,8 +674,8 @@ for targetIdx = 1, 3 do
     rCorner.CornerRadius = UDim.new(0, 6)
 
     local targetTag = Instance.new("TextLabel")
-    targetTag.Size = UDim2.new(0, 70, 1, 0)
-    targetTag.Position = UDim2.new(0, 8, 0, 0)
+    targetTag.Size = UDim2.new(0, 52, 1, 0)
+    targetTag.Position = UDim2.new(0, 6, 0, 0)
     targetTag.BackgroundTransparency = 1
     targetTag.Font = Enum.Font.SourceSansBold
     targetTag.TextSize = 12
@@ -684,15 +685,15 @@ for targetIdx = 1, 3 do
     targetTag.Parent = row
 
     local userBox = Instance.new("TextBox")
-    userBox.Size = UDim2.new(0, 150, 0, 26)
-    userBox.Position = UDim2.new(0, 78, 0, 5)
+    userBox.Size = UDim2.new(0, 126, 0, 26)
+    userBox.Position = UDim2.new(0, 58, 0, 5)
     userBox.BackgroundColor3 = Color3.fromRGB(36, 42, 54)
     userBox.BorderSizePixel = 0
     userBox.Font = Enum.Font.SourceSansBold
     userBox.TextSize = 12
     userBox.TextColor3 = Color3.fromRGB(255, 255, 255)
     userBox.PlaceholderColor3 = Color3.fromRGB(140, 150, 165)
-    userBox.PlaceholderText = "Username Akun " .. targetIdx
+    userBox.PlaceholderText = "Username " .. targetIdx
     userBox.Text = Config.Targets[targetIdx].Username
     userBox.ClearTextOnFocus = false
     userBox.Parent = row
@@ -701,44 +702,125 @@ for targetIdx = 1, 3 do
 
     userBox.FocusLost:Connect(function()
         Config.Targets[targetIdx].Username = userBox.Text:gsub("^@", ""):gsub("%s+", "")
+        if Config.Targets[targetIdx].Username ~= "" and Config.Targets[targetIdx].Status == "Kosong" then
+            Config.Targets[targetIdx].Status = "Siap"
+        end
+        if UpdateKirimTabUI then UpdateKirimTabUI() end
     end)
 
-    -- Tombol Pilih Player di Server (Cycle)
-    local pickBtn = Instance.new("TextButton")
-    pickBtn.Size = UDim2.new(0, 85, 0, 26)
-    pickBtn.Position = UDim2.new(0, 234, 0, 5)
-    pickBtn.BackgroundColor3 = Color3.fromRGB(40, 70, 95)
-    pickBtn.Font = Enum.Font.SourceSansBold
-    pickBtn.TextSize = 11
-    pickBtn.TextColor3 = Color3.fromRGB(220, 235, 255)
-    pickBtn.Text = "Pilih Player"
-    pickBtn.Parent = row
-    local pbCorner = Instance.new("UICorner", pickBtn)
-    pbCorner.CornerRadius = UDim.new(0, 4)
+    -- Tombol Pilih Player Sebelumnya (<)
+    local prevBtn = Instance.new("TextButton")
+    prevBtn.Size = UDim2.new(0, 24, 0, 26)
+    prevBtn.Position = UDim2.new(0, 188, 0, 5)
+    prevBtn.BackgroundColor3 = Color3.fromRGB(40, 70, 95)
+    prevBtn.Font = Enum.Font.SourceSansBold
+    prevBtn.TextSize = 14
+    prevBtn.TextColor3 = Color3.fromRGB(220, 235, 255)
+    prevBtn.Text = "<"
+    prevBtn.Parent = row
+    local prevCorner = Instance.new("UICorner", prevBtn)
+    prevCorner.CornerRadius = UDim.new(0, 4)
 
-    local currentPlrCycle = 1
-    pickBtn.MouseButton1Click:Connect(function()
-        local serverPlrs = {}
+    -- Tombol Pilih Player Berikutnya (>)
+    local nextBtn = Instance.new("TextButton")
+    nextBtn.Size = UDim2.new(0, 24, 0, 26)
+    nextBtn.Position = UDim2.new(0, 216, 0, 5)
+    nextBtn.BackgroundColor3 = Color3.fromRGB(40, 70, 95)
+    nextBtn.Font = Enum.Font.SourceSansBold
+    nextBtn.TextSize = 14
+    nextBtn.TextColor3 = Color3.fromRGB(220, 235, 255)
+    nextBtn.Text = ">"
+    nextBtn.Parent = row
+    local nextCorner = Instance.new("UICorner", nextBtn)
+    nextCorner.CornerRadius = UDim.new(0, 4)
+
+    -- Tombol Refresh Kuota Akun (Refresh) - diberi jarak 24px dari tombol >
+    local refreshBtn = Instance.new("TextButton")
+    refreshBtn.Size = UDim2.new(0, 54, 0, 26)
+    refreshBtn.Position = UDim2.new(0, 264, 0, 5)
+    refreshBtn.BackgroundColor3 = Color3.fromRGB(36, 85, 120)
+    refreshBtn.Font = Enum.Font.SourceSansBold
+    refreshBtn.TextSize = 11
+    refreshBtn.TextColor3 = Color3.fromRGB(220, 245, 255)
+    refreshBtn.Text = "Refresh"
+    refreshBtn.Parent = row
+    local refCorner = Instance.new("UICorner", refreshBtn)
+    refCorner.CornerRadius = UDim.new(0, 4)
+
+    local currentPlrCycle = 0
+    local function GetOtherPlayers()
+        local list = {}
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LocalPlayer then
-                table.insert(serverPlrs, p.Name)
+                table.insert(list, p.Name)
             end
         end
+        return list
+    end
 
+    prevBtn.MouseButton1Click:Connect(function()
+        local serverPlrs = GetOtherPlayers()
         if #serverPlrs == 0 then
             userBox.Text = "Tidak ada player"
             return
         end
-
-        currentPlrCycle = (currentPlrCycle % #serverPlrs) + 1
+        currentPlrCycle = currentPlrCycle - 1
+        if currentPlrCycle < 1 then
+            currentPlrCycle = #serverPlrs
+        end
         local selectedName = serverPlrs[currentPlrCycle]
         userBox.Text = selectedName
         Config.Targets[targetIdx].Username = selectedName
+        if Config.Targets[targetIdx].Status == "Kosong" or Config.Targets[targetIdx].Status == "Tidak Online" then
+            Config.Targets[targetIdx].Status = "Siap"
+        end
+        if UpdateKirimTabUI then UpdateKirimTabUI() end
+    end)
+
+    nextBtn.MouseButton1Click:Connect(function()
+        local serverPlrs = GetOtherPlayers()
+        if #serverPlrs == 0 then
+            userBox.Text = "Tidak ada player"
+            return
+        end
+        currentPlrCycle = currentPlrCycle + 1
+        if currentPlrCycle > #serverPlrs then
+            currentPlrCycle = 1
+        end
+        local selectedName = serverPlrs[currentPlrCycle]
+        userBox.Text = selectedName
+        Config.Targets[targetIdx].Username = selectedName
+        if Config.Targets[targetIdx].Status == "Kosong" or Config.Targets[targetIdx].Status == "Tidak Online" then
+            Config.Targets[targetIdx].Status = "Siap"
+        end
+        if UpdateKirimTabUI then UpdateKirimTabUI() end
+    end)
+
+    refreshBtn.MouseButton1Click:Connect(function()
+        Config.Targets[targetIdx].Sent = 0
+        if Config.Targets[targetIdx].Username ~= "" then
+            Config.Targets[targetIdx].Status = "Siap"
+        else
+            Config.Targets[targetIdx].Status = "Kosong"
+        end
+
+        -- Bersihkan pet pending untuk target ini agar bisa dikirim kembali
+        for uuid, info in pairs(PendingGiftPets) do
+            if info.TargetIdx == targetIdx then
+                PendingGiftPets[uuid] = nil
+            end
+        end
+
+        if UpdateKirimTabUI then UpdateKirimTabUI() end
+        local targetName = Config.Targets[targetIdx].Username
+        if targetName == "" then targetName = "Target" end
+        SenderStatusLbl.Text = string.format("Akun %d (@%s) di-refresh! Kuota 15 pet siap dikirim ulang.", targetIdx, targetName)
+        SenderStatusLbl.TextColor3 = Color3.fromRGB(100, 255, 140)
     end)
 
     local progressLbl = Instance.new("TextLabel")
-    progressLbl.Size = UDim2.new(1, -330, 1, 0)
-    progressLbl.Position = UDim2.new(0, 325, 0, 0)
+    progressLbl.Size = UDim2.new(1, -328, 1, 0)
+    progressLbl.Position = UDim2.new(0, 324, 0, 0)
     progressLbl.BackgroundTransparency = 1
     progressLbl.Font = Enum.Font.SourceSansBold
     progressLbl.TextSize = 12
@@ -749,7 +831,10 @@ for targetIdx = 1, 3 do
 
     TargetCardsUI[targetIdx] = {
         UserBox = userBox,
-        ProgressLbl = progressLbl
+        ProgressLbl = progressLbl,
+        PrevBtn = prevBtn,
+        NextBtn = nextBtn,
+        RefreshBtn = refreshBtn
     }
 end
 
@@ -990,7 +1075,7 @@ StartSenderBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
-local function UpdateKirimTabUI()
+UpdateKirimTabUI = function()
     for idx = 1, 3 do
         local ui = TargetCardsUI[idx]
         local cfg = Config.Targets[idx]
