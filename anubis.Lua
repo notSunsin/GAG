@@ -179,6 +179,7 @@ local Config = {
     AutoSubmitArchieBackpack = false, -- Otomatis submit buah bertipe Archie di backpack (loop 5s)
     AutoRestartEvent = true,          -- Otomatis restart event jika 20/20 finds selesai (1T Sheckles)
     AutoSellFruitsToSamOnTraitChange = true, -- Otomatis jual seluruh buah di tas ke NPC Sam saat trait Archie berubah
+    SkipRewardAnimation = true,       -- Hilangkan/skip animasi opening reward Archie secara instan ("Brushed Up")
     BackpackCheckInterval = 5.0,      -- Interval cek & refresh backpack (5 detik)
     CollectInterval = 1.0,            -- Jeda antar siklus cek kebun (detik)
     BatchDelay = 0.08,                -- Jeda antar remote collect (anti-throttle)
@@ -207,6 +208,9 @@ local UpdateStatsDisplay
 local CheckAndSubmitBackpackFruits
 local CheckAndAutoRestartArchie
 local SellAllFruitsToSam
+local PatchRevealConfig
+local DismissActiveRewardCard
+local SetupRewardAnimationSkipper
 
 -- ========================================================================================
 -- 4. LOGIKA PENDETEKSI KEBUTUHAN NPC ARCHIE (REAL-TIME SYNC)
@@ -1004,6 +1008,197 @@ CheckAndAutoRestartArchie = function()
     return false
 end
 
+
+-- ========================================================================================
+-- FITUR: HILANGKAN / SKIP ANIMASI OPENING REWARD ("Brushed Up" / Dug Up / 3D Model Spin)
+-- ========================================================================================
+
+-- Patch in-memory Game Config agar durasi reveal menjadi instan (0 detik)
+PatchRevealConfig = function()
+    pcall(function()
+        if AncientArcConfig then
+            AncientArcConfig.REVEAL_FLY_TIME = 0.001
+            AncientArcConfig.REVEAL_HOLD_TIME = 0
+            AncientArcConfig.REVEAL_SHAKE = 0
+            AncientArcConfig.REVEAL_POPUP_TIME = 0.001
+        end
+    end)
+    pcall(function()
+        local GameConfigController = ModulesFolder and require(ModulesFolder:WaitForChild("GameConfigController", 2))
+        if GameConfigController and GameConfigController.GetConfig then
+            local cfg = GameConfigController:GetConfig("AncientArcConfig")
+            if cfg then
+                cfg.REVEAL_FLY_TIME = 0.001
+                cfg.REVEAL_HOLD_TIME = 0
+                cfg.REVEAL_SHAKE = 0
+                cfg.REVEAL_POPUP_TIME = 0.001
+            end
+        end
+    end)
+end
+
+-- Helper untuk menutup card popup reward secara instan melalui klik sensor / visible = false
+local function DismissRewardCard(card)
+    if not card or not card:IsA("GuiObject") then return end
+    pcall(function()
+        local sensor = card:FindFirstChild("SENSOR", true)
+        if sensor and sensor:IsA("GuiButton") then
+            local clicked = false
+            if firesignal then
+                pcall(function() firesignal(sensor.Activated); clicked = true end)
+            end
+            if not clicked and getconnections then
+                pcall(function()
+                    for _, conn in ipairs(getconnections(sensor.Activated)) do
+                        pcall(function() conn:Fire(); clicked = true end)
+                    end
+                end)
+            end
+            if not clicked and sensor.Activate then
+                pcall(function() sensor:Activate(); clicked = true end)
+            end
+        end
+        card.Visible = false
+    end)
+end
+
+-- Cari dan tutup reward popup yang sedang terbuka di PlayerGui
+DismissActiveRewardCard = function()
+    pcall(function()
+        local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+        if not pgui then return end
+        for _, desc in ipairs(pgui:GetDescendants()) do
+            if desc.Name == "AncientArcEventReward" and desc:IsA("GuiObject") and desc.Visible then
+                DismissRewardCard(desc)
+                if AppendLog then
+                    AppendLog("[REWARD] Animasi reward ('Brushed Up') berhasil dilewati instan!", Color3.fromRGB(255, 215, 0))
+                end
+            elseif desc.Name == "AncientArcReveal_UI" and desc:IsA("ScreenGui") then
+                desc.Enabled = false
+                pcall(function() desc:Destroy() end)
+            end
+        end
+    end)
+end
+
+-- Pasang listener pemantau reward & model 3D di PlayerGui & Workspace
+SetupRewardAnimationSkipper = function()
+    PatchRevealConfig()
+
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if not pgui then return end
+
+    local function HookRewardCard(card)
+        if not card or not card:IsA("GuiObject") then return end
+        if card:GetAttribute("HUKI_RewardHooked") then return end
+        pcall(function() card:SetAttribute("HUKI_RewardHooked", true) end)
+
+        if Config.SkipRewardAnimation and card.Visible then
+            task.defer(function()
+                DismissRewardCard(card)
+                if AppendLog then
+                    AppendLog("[REWARD] Animasi reward ('Brushed Up') dilewati instan!", Color3.fromRGB(255, 215, 0))
+                end
+            end)
+        end
+
+        card:GetPropertyChangedSignal("Visible"):Connect(function()
+            if Config.SkipRewardAnimation and card.Visible then
+                task.defer(function()
+                    DismissRewardCard(card)
+                    if AppendLog then
+                        AppendLog("[REWARD] Animasi reward ('Brushed Up') dilewati instan!", Color3.fromRGB(255, 215, 0))
+                    end
+                end)
+            end
+        end)
+    end
+
+    -- Hook card yang sudah ada di PlayerGui
+    pcall(function()
+        for _, desc in ipairs(pgui:GetDescendants()) do
+            if desc.Name == "AncientArcEventReward" and desc:IsA("GuiObject") then
+                HookRewardCard(desc)
+            elseif desc.Name == "AncientArcReveal_UI" and desc:IsA("ScreenGui") then
+                if Config.SkipRewardAnimation then
+                    desc.Enabled = false
+                    pcall(function() desc:Destroy() end)
+                end
+            end
+        end
+    end)
+
+    -- Hook card atau ScreenGui baru yang ditambahkan kemudian
+    pgui.DescendantAdded:Connect(function(desc)
+        if not Config.SkipRewardAnimation then return end
+        pcall(function()
+            if desc.Name == "AncientArcEventReward" and desc:IsA("GuiObject") then
+                HookRewardCard(desc)
+                task.defer(function()
+                    if Config.SkipRewardAnimation and desc.Visible then
+                        DismissRewardCard(desc)
+                        if AppendLog then
+                            AppendLog("[REWARD] Animasi reward ('Brushed Up') dilewati instan!", Color3.fromRGB(255, 215, 0))
+                        end
+                    end
+                end)
+            elseif desc.Name == "AncientArcReveal_UI" and desc:IsA("ScreenGui") then
+                desc.Enabled = false
+                task.defer(function()
+                    pcall(function() desc:Destroy() end)
+                end)
+            end
+        end)
+    end)
+
+    -- Sembunyikan model 3D spin crate/urn yang berputar di depan kamera
+    workspace.DescendantAdded:Connect(function(desc)
+        if not Config.SkipRewardAnimation then return end
+        pcall(function()
+            if desc.Name == "CentralWeldPart" and desc:IsA("BasePart") then
+                local model = desc.Parent
+                if model and model:IsA("Model") then
+                    for _, p in ipairs(model:GetDescendants()) do
+                        if p:IsA("BasePart") then
+                            p.Transparency = 1
+                        end
+                    end
+                end
+            end
+        end)
+    end)
+
+    -- Hook AncientArcController.Open jika tersedia agar invoke server langsung cepat
+    pcall(function()
+        if AncientArcController and type(AncientArcController.Open) == "function" then
+            local oldOpen = AncientArcController.Open
+            AncientArcController.Open = function(self, ...)
+                if Config.SkipRewardAnimation then
+                    PatchRevealConfig()
+                end
+                local res = oldOpen(self, ...)
+                if Config.SkipRewardAnimation then
+                    task.defer(function()
+                        DismissActiveRewardCard()
+                    end)
+                end
+                return res
+            end
+        end
+    end)
+
+    -- Periodic background loop pengaman
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if Config.SkipRewardAnimation then
+                pcall(DismissActiveRewardCard)
+                pcall(PatchRevealConfig)
+            end
+        end
+    end)
+end
+
 -- ========================================================================================
 -- 6. EKSEKUSI PEMANENAN & SUBMIT ARCHIE
 -- ========================================================================================
@@ -1380,7 +1575,7 @@ Content.BackgroundTransparency = 1
 Content.BorderSizePixel = 0
 Content.ScrollBarThickness = 4
 Content.ScrollBarImageColor3 = Color3.fromRGB(60, 70, 85)
-Content.CanvasSize = UDim2.new(0, 0, 0, 680)
+Content.CanvasSize = UDim2.new(0, 0, 0, 720)
 Content.Parent = MainFrame
 
 local ContentLayout = Instance.new("UIListLayout")
@@ -1476,9 +1671,9 @@ UpdateTraitDisplay = function()
 end
 
 -- ============================================================================
--- SECTION 2: KONTROL AUTO COLLECT & TOGGLES (6 TOGGLES)
+-- SECTION 2: KONTROL AUTO COLLECT & TOGGLES (7 TOGGLES)
 -- ============================================================================
-local Section2 = CreateSection(2, 196)
+local Section2 = CreateSection(2, 226)
 
 local function CreateToggleRow(yPos, titleText, initialVal, onToggleCallback)
     local row = Instance.new("Frame")
@@ -1586,6 +1781,18 @@ end)
 CreateToggleRow(158, "Proteksi Solo Nightmare (Jangan Panen)", Config.ProtectSoloNightmare, function(val)
     Config.ProtectSoloNightmare = val
     AppendLog(val and "[CONFIG] Proteksi Solo Nightmare AKTIF." or "[CONFIG] Proteksi Solo Nightmare NONAKTIF.", Color3.fromRGB(200, 200, 200))
+end)
+
+-- Toggle 7: Skip Animasi Opening Reward ("Brushed Up")
+CreateToggleRow(188, "Skip Opening Reward Animation", Config.SkipRewardAnimation, function(val)
+    Config.SkipRewardAnimation = val
+    if val then
+        if PatchRevealConfig then PatchRevealConfig() end
+        if DismissActiveRewardCard then DismissActiveRewardCard() end
+        AppendLog("[REWARD] Skip Animasi Opening Reward DIAKTIFKAN.", Color3.fromRGB(255, 215, 0))
+    else
+        AppendLog("[REWARD] Skip Animasi Opening Reward NONAKTIF.", Color3.fromRGB(200, 200, 200))
+    end
 end)
 
 -- ============================================================================
@@ -1760,6 +1967,9 @@ end
 -- Inisialisasi Pertama
 task.spawn(function()
     task.wait(0.2)
+    if SetupRewardAnimationSkipper then
+        pcall(SetupRewardAnimationSkipper)
+    end
     CheckAndUpdateArchieTrait()
     UpdateTraitDisplay()
     GetMatchingHarvestables()
@@ -1768,5 +1978,8 @@ task.spawn(function()
     end
     AppendLog("Script Auto Collect Archie siap digunakan!", Color3.fromRGB(0, 255, 170))
     AppendLog(string.format("Kebutuhan Archie saat ini: [%s]", State.CurrentArchieTrait or "Fruit"), TraitColorMap[State.CurrentArchieTrait] or Color3.fromRGB(255, 255, 255))
+    if Config.SkipRewardAnimation then
+        AppendLog("[REWARD] Bypass animasi opening reward ('Brushed Up') aktif!", Color3.fromRGB(255, 215, 0))
+    end
 end)
 
