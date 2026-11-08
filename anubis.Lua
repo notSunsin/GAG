@@ -1,29 +1,25 @@
-
--- ========================================================================================
--- 1. SERVICE & INISIALISASI DASAR
--- ========================================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+local _RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local CollectionService = game:GetService("CollectionService")
-local CoreGui = game:GetService("CoreGui")
+local _CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
 
 -- Pembersihan instance GUI lama jika ada
-if getgenv and getgenv().HUKI_ArchieCollector_Gui then
+if getgenv and getgenv().HiiHuu_ArchieCollector_Gui then
     pcall(function()
-        getgenv().HUKI_ArchieCollector_Gui:Destroy()
+        getgenv().HiiHuu_ArchieCollector_Gui:Destroy()
     end)
-    getgenv().HUKI_ArchieCollector_Gui = nil
+    getgenv().HiiHuu_ArchieCollector_Gui = nil
 end
 
 pcall(function()
     local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
     if pgui then
-        local old = pgui:FindFirstChild("HUKI_ArchieCollector_Gui")
+        local old = pgui:FindFirstChild("HiiHuu_ArchieCollector_Gui")
         if old then old:Destroy() end
     end
 end)
@@ -56,14 +52,27 @@ local AncientArcFolder = AnubisEventFolder and AnubisEventFolder:FindFirstChild(
 
 -- Remote Archeologist Archie
 local AncientArcSubmitRemote = AncientArcFolder and AncientArcFolder:FindFirstChild("Submit")
-local AncientArcOpenRemote = AncientArcFolder and AncientArcFolder:FindFirstChild("Open")
-local AncientArcRestartRemote = AncientArcFolder and AncientArcFolder:FindFirstChild("Restart")
+local _AncientArcOpenRemote = AncientArcFolder and AncientArcFolder:FindFirstChild("Open")
+local _AncientArcRestartRemote = AncientArcFolder and AncientArcFolder:FindFirstChild("Restart")
 
 -- Remote Crops & Selling to Sam
 local CropsEvents = GameEvents and GameEvents:FindFirstChild("Crops")
 local CollectRemote = CropsEvents and CropsEvents:FindFirstChild("Collect")
 local SellItemRemote = GameEvents and GameEvents:FindFirstChild("Sell_Item")
-local SellInventoryRemote = GameEvents and GameEvents:FindFirstChild("Sell_Inventory")
+local _SellInventoryRemote = GameEvents and GameEvents:FindFirstChild("Sell_Inventory")
+
+-- Remote Trader Tina / Anubis Coin Shop
+local BuyEventShopStockRemote = GameEvents and GameEvents:FindFirstChild("BuyEventShopStock")
+if not BuyEventShopStockRemote then
+    pcall(function()
+        BuyEventShopStockRemote = ReplicatedStorage:WaitForChild("GameEvents", 5):WaitForChild("BuyEventShopStock", 5)
+    end)
+end
+if not BuyEventShopStockRemote then
+    pcall(function()
+        BuyEventShopStockRemote = ReplicatedStorage:FindFirstChild("BuyEventShopStock", true)
+    end)
+end
 
 -- Resolusi Modul Internal Game
 local ModulesFolder = ReplicatedStorage:WaitForChild("Modules", 10)
@@ -138,6 +147,32 @@ pcall(function()
     end
 end)
 
+-- 11 Item Resmi Anubis Coin Shop (NPC Trader Tina)
+local TinaShopItems = {
+    { Name = "Wraproot",           Price = 60,    Type = "Seed",     Rarity = "Uncommon" },
+    { Name = "Hieroglyph Carpet",  Price = 150,   Type = "Cosmetic", Rarity = "Uncommon" },
+    { Name = "Hieroglyphic Radar", Price = 250,   Type = "Gear",     Rarity = "Rare" },
+    { Name = "Quicksand Mummy",    Price = 450,   Type = "Cosmetic", Rarity = "Rare" },
+    { Name = "Anubis Crate",       Price = 500,   Type = "Crate",    Rarity = "Rare" },
+    { Name = "Papyrus",            Price = 900,   Type = "Seed",     Rarity = "Legendary" },
+    { Name = "Obsidian Obelisk",   Price = 1000,  Type = "Cosmetic", Rarity = "Mythical" },
+    { Name = "Hieroglyphic Staff", Price = 1250,  Type = "Gear",     Rarity = "Legendary" },
+    { Name = "Anubis Egg",         Price = 3000,  Type = "Egg",      Rarity = "Mythical" },
+    { Name = "Pharaoh's Eye",      Price = 5000,  Type = "Seed",     Rarity = "Divine" },
+    { Name = "Hiero Scorpion",     Price = 13500, Type = "Pet",      Rarity = "Prismatic" },
+}
+
+-- Warna Rarity untuk UI Shop
+local RarityColorMap = {
+    ["Common"]    = Color3.fromRGB(180, 180, 180),
+    ["Uncommon"]  = Color3.fromRGB(46, 204, 113),
+    ["Rare"]      = Color3.fromRGB(52, 152, 219),
+    ["Legendary"] = Color3.fromRGB(241, 196, 15),
+    ["Mythical"]  = Color3.fromRGB(155, 89, 182),
+    ["Divine"]    = Color3.fromRGB(230, 126, 34),
+    ["Prismatic"] = Color3.fromRGB(255, 75, 130),
+}
+
 -- ========================================================================================
 -- 3. STATE & KONFIGURASI APLIKASI
 -- ========================================================================================
@@ -155,6 +190,24 @@ local Config = {
     ProtectSoloNightmare = true,      -- Lewatkan jika hanya memiliki mutasi Nightmare polos
     SkipFavorited = true,             -- Lewatkan tanaman/buah yang di-favoritkan
     CheckBackpack = true,             -- Berhenti panen jika ransel sudah penuh
+
+    -- Trader Tina (Anubis Coin Shop)
+    TinaAutoBuy = false,              -- Auto Buy selected items loop
+    TinaBuyInterval = 1.5,            -- Interval loop auto buy (detik)
+    TinaBuyDelay = 0.25,              -- Jeda antar pembelian remote (anti rate-limit)
+    TinaSelectedItems = {
+        ["Wraproot"] = false,
+        ["Hieroglyph Carpet"] = false,
+        ["Hieroglyphic Radar"] = false,
+        ["Quicksand Mummy"] = false,
+        ["Anubis Crate"] = false,
+        ["Papyrus"] = false,
+        ["Obsidian Obelisk"] = false,
+        ["Hieroglyphic Staff"] = false,
+        ["Anubis Egg"] = true,
+        ["Pharaoh's Eye"] = true,
+        ["Hiero Scorpion"] = true,
+    },
 }
 
 local State = {
@@ -168,6 +221,7 @@ local State = {
     IsRestarting = false,               -- Mutex proses restart event
     IsSellingToSam = false,             -- Mutex proses jual ke Sam
     ArchieModel = nil,                  -- Instance model Archie di workspace
+    ActiveTab = "Archie",               -- Tab UI aktif ("Archie" atau "Tina")
 }
 
 -- Forward declarations untuk UI updater & Logger
@@ -180,6 +234,10 @@ local SellAllFruitsToSam
 local PatchRevealConfig
 local DismissActiveRewardCard
 local SetupRewardAnimationSkipper
+local UpdateTinaCoinsDisplay
+local UpdateTinaCheckboxes
+local BuyAllSelectedTinaItems
+local BuyTinaItem
 
 -- ========================================================================================
 -- 4. LOGIKA PENDETEKSI KEBUTUHAN NPC ARCHIE (REAL-TIME SYNC)
@@ -538,7 +596,7 @@ local function ShouldCollectMatchingFruit(fruitModel)
 
     -- 2. Proteksi Solo Nightmare
     if Config.ProtectSoloNightmare then
-        local mutMap, mutCount = GetFruitMutations(fruitModel)
+        local mutMap, _mutCount = GetFruitMutations(fruitModel)
         local hasNightmare = mutMap["Nightmare"] or fruitModel:GetAttribute("Nightmare") == true
         local hasWet = mutMap["Wet"] or fruitModel:GetAttribute("Wet") == true
         if hasNightmare and not hasWet then
@@ -665,7 +723,7 @@ local function GetMatchingFruitsInBackpack(targetTrait)
 end
 
 -- Forward declaration fungsi SubmitAllToArchie
-local SubmitAllToArchie
+local _SubmitAllToArchie
 
 -- Periksa dan Auto Submit Buah di Backpack ke Archie
 local function CheckAndSubmitBackpackFruits()
@@ -871,7 +929,7 @@ CheckAndAutoRestartArchie = function()
     if State.IsRestarting then return false end
 
     local canRestart = false
-    local detailReason = ""
+    local _detailReason = ""
 
     -- 1. Evaluasi melalui modul resmi AncientArcController
     if AncientArcController then
@@ -977,7 +1035,6 @@ CheckAndAutoRestartArchie = function()
     return false
 end
 
-
 -- ========================================================================================
 -- FITUR: HILANGKAN / SKIP ANIMASI OPENING REWARD ("Brushed Up" / Dug Up / 3D Model Spin)
 -- ========================================================================================
@@ -1059,8 +1116,8 @@ SetupRewardAnimationSkipper = function()
 
     local function HookRewardCard(card)
         if not card or not card:IsA("GuiObject") then return end
-        if card:GetAttribute("HUKI_RewardHooked") then return end
-        pcall(function() card:SetAttribute("HUKI_RewardHooked", true) end)
+        if card:GetAttribute("HiiHuu_RewardHooked") then return end
+        pcall(function() card:SetAttribute("HiiHuu_RewardHooked", true) end)
 
         if Config.SkipRewardAnimation and card.Visible then
             task.defer(function()
@@ -1166,6 +1223,122 @@ SetupRewardAnimationSkipper = function()
             end
         end
     end)
+end
+
+-- ========================================================================================
+-- FITUR: AUTO BUY NPC TRADER TINA (ANUBIS COIN SHOP)
+-- ========================================================================================
+
+-- Format angka dengan koma (contoh: 13,500)
+local function CommaNumber(amount)
+    local formatted = tostring(math.floor(tonumber(amount) or 0))
+    local k
+    while true do
+        formatted, k = string.gsub(formatted, "^(-?%d+)(%d%d%d)", "%1,%2")
+        if k == 0 then break end
+    end
+    return formatted
+end
+
+-- Mendapatkan jumlah Anubis Coins yang dimiliki player saat ini
+local function GetAnubisCoins()
+    local coins = 0
+    pcall(function()
+        if DataService and DataService.GetData then
+            local data = DataService:GetData()
+            if data and data.AnubisCoins ~= nil then
+                coins = tonumber(data.AnubisCoins) or 0
+            end
+        end
+    end)
+    return coins
+end
+
+-- Mendapatkan data stock item yang tersedia di shop Tina
+local function GetItemStock(itemName)
+    local stock = -1 -- -1 jika data stock tidak spesifik (tetap proses beli)
+    pcall(function()
+        if DataService and DataService.GetData then
+            local data = DataService:GetData()
+            local shopStock = data and data.EventShopStock and data.EventShopStock["Anubis Coin Shop"]
+            if shopStock and shopStock.Stocks then
+                local itemData = shopStock.Stocks[itemName]
+                if itemData and itemData.Stock ~= nil then
+                    stock = tonumber(itemData.Stock) or 0
+                end
+            end
+        end
+    end)
+    return stock
+end
+
+-- Eksekusi pembelian 1 item spesifik ke remote resmi
+BuyTinaItem = function(itemName)
+    if not BuyEventShopStockRemote then
+        pcall(function()
+            BuyEventShopStockRemote = (GameEvents and GameEvents:FindFirstChild("BuyEventShopStock"))
+                or ReplicatedStorage:FindFirstChild("BuyEventShopStock", true)
+        end)
+    end
+
+    if not BuyEventShopStockRemote then
+        AppendLog("[ERROR] Remote BuyEventShopStock tidak ditemukan!", Color3.fromRGB(255, 80, 80))
+        return false
+    end
+
+    local ok, _err = pcall(function()
+        BuyEventShopStockRemote:FireServer(itemName, "Anubis Coin Shop")
+    end)
+    return ok
+end
+
+-- Eksekusi pembelian 1x seluruh item yang dicentang di UI
+BuyAllSelectedTinaItems = function()
+    local selectedCount = 0
+    for _, item in ipairs(TinaShopItems) do
+        if Config.TinaSelectedItems[item.Name] then
+            selectedCount = selectedCount + 1
+            local success = BuyTinaItem(item.Name)
+            if success then
+                AppendLog(string.format("[TINA BUY] Sukses membeli %s (🪙 %s Coins)", item.Name, CommaNumber(item.Price)), Color3.fromRGB(255, 215, 0))
+            end
+            task.wait(Config.TinaBuyDelay or 0.25)
+        end
+    end
+
+    if selectedCount == 0 then
+        AppendLog("[TINA] Peringatan: Belum ada item yang dicentang!", Color3.fromRGB(240, 200, 100))
+    else
+        AppendLog(string.format("[TINA] Selesai mengirim pembelian %d item ke Anubis Coin Shop!", selectedCount), Color3.fromRGB(100, 255, 120))
+    end
+
+    if UpdateTinaCoinsDisplay then
+        pcall(UpdateTinaCoinsDisplay)
+    end
+end
+
+-- Teleport ke NPC Trader Tina
+local function TeleportToTraderTina()
+    local tinaModel = nil
+    pcall(function()
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Model") and (string.find(obj.Name:lower(), "tina") or string.find(obj.Name:lower(), "trader")) then
+                tinaModel = obj
+                break
+            end
+        end
+    end)
+    if tinaModel then
+        local targetPos = tinaModel:GetPivot().Position
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 4), targetPos)
+            AppendLog("[TELEPORT] Berhasil teleport ke NPC Trader Tina!", Color3.fromRGB(100, 255, 150))
+            return
+        end
+    end
+    AppendLog("[INFO] Model NPC Trader Tina tidak ditemukan di workspace (Remote pembelian tetap berjalan normal)!", Color3.fromRGB(240, 200, 100))
 end
 
 -- ========================================================================================
@@ -1374,26 +1547,53 @@ task.spawn(function()
     end
 end)
 
+-- Loop 3: Auto Buy Trader Tina (Anubis Coin Shop)
+task.spawn(function()
+    while true do
+        task.wait(Config.TinaBuyInterval or 1.5)
+        if Config.TinaAutoBuy then
+            local anyAttempted = false
+            for _, item in ipairs(TinaShopItems) do
+                if not Config.TinaAutoBuy then break end
+                if Config.TinaSelectedItems[item.Name] then
+                    local stock = GetItemStock(item.Name)
+                    if stock > 0 or stock == -1 then
+                        local ok = BuyTinaItem(item.Name)
+                        if ok then
+                            anyAttempted = true
+                            AppendLog(string.format("[AUTO BUY TINA] Membeli %s (🪙 %s Coins)", item.Name, CommaNumber(item.Price)), Color3.fromRGB(255, 215, 0))
+                        end
+                        task.wait(Config.TinaBuyDelay or 0.25)
+                    end
+                end
+            end
+            if anyAttempted and UpdateTinaCoinsDisplay then
+                pcall(UpdateTinaCoinsDisplay)
+            end
+        end
+    end
+end)
+
 -- ========================================================================================
--- 8. PEMBUATAN USER INTERFACE (HUKI MODERN DARK THEME)
+-- 8. PEMBUATAN USER INTERFACE (HiiHuu MODERN DARK THEME)
 -- ========================================================================================
 local safeParent = GetSafeGuiParent()
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "HUKI_ArchieCollector_Gui"
+ScreenGui.Name = "HiiHuu_ArchieCollector_Gui"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = safeParent
 
 if getgenv then
-    getgenv().HUKI_ArchieCollector_Gui = ScreenGui
+    getgenv().HiiHuu_ArchieCollector_Gui = ScreenGui
 end
 
 -- Container Utama
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 380, 0, 480)
-MainFrame.Position = UDim2.new(0.5, -190, 0.45, -240)
+MainFrame.Size = UDim2.new(0, 380, 0, 520)
+MainFrame.Position = UDim2.new(0.5, -190, 0.45, -260)
 MainFrame.BackgroundColor3 = Color3.fromRGB(18, 20, 24)
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
@@ -1408,36 +1608,163 @@ MainStroke.Thickness = 1.2
 MainStroke.Color = Color3.fromRGB(45, 52, 65)
 MainStroke.Parent = MainFrame
 
--- Floating Minimize Pill (Tombol restore saat di-minimize)
-local MinimizePill = Instance.new("TextButton")
+-- ========================================================================================
+-- FLOATING LOGO ASSET LOADER (CLAUDE ICON / CUSTOM LINK)
+-- ========================================================================================
+local FLOATING_LOGO_URL = "" -- URL gambar langsung opsional
+local FLOATING_LOGO_LOCAL_PATH = "HiiHuu/claude_logo.png"
+local FLOATING_LOGO_FALLBACK_B64 = "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rV97rGEJGRz0rwban5MC0GoNBoeGpJH02PWxvmIlqW1W5Aavuhn0glIYhtZA4pXYeRKvuPQMWN/ad6iSHRav6ViGzpjAlh993cf28Wi2iQZN91hks3qt74WKsUYkMEKYTQN5hcl67I3IDkHuV6O3+6Sw9aLPDE62TlG/Vlo/5wSgVRC2stXMBELbP3rDeai5VD2Xi3CJKucquiw0ppgPLNZMc89nyR6n023fvrnPV5urWX58ljGVnEaGcWbCqFGLqCeOyPkacEBEXhB4HDHbFH1k48JLd7QyWfv6LL29OhcYPycFYKZr2No7LMdDxU/19eVyS5OeSKPlVuxq9bpS0ZVeWQKyCNGFqHYqlBApAHmBvKqGkhoGc7yl0amqq0clEaEG1BXqAhVFxkV1VIXDghwA3Wet2YPzO71lb06TgxtuveuHTvPQ2/osg/Bam/qzSgB+aD6iv1+2Zi3R13GdPxENUpDnfv0dOVfI5WTM5xMoaT4IfewDG2Kdb6SiIyCHNepcjEuMunygUaRJNcrWsvz12uuigRN5z8yCtXxOZQ4y/WwTgOMyd0s/snGoT7pbx6W3pufq9Z0BbVMQ+vuFoSFpHdE+NNSj23t7dcurkLefF4CTtRwt3NuypV+2cOKr77dsGdAZiFGZp3map3map3map3map3map3map3map3map3map3map3map3map3map3map3map3map3map3ma0/S/Ae7AI3Kn/1KJAAAAAElFTkSuQmCC"
+
+local function DecodeBase64(data)
+    if crypt and crypt.base64decode then
+        local ok, res = pcall(function() return crypt.base64decode(data) end)
+        if ok and res then return res end
+    end
+    if syn and syn.crypt and syn.crypt.base64 and syn.crypt.base64.decode then
+        local ok, res = pcall(function() return syn.crypt.base64.decode(data) end)
+        if ok and res then return res end
+    end
+    if base64_decode then
+        local ok, res = pcall(function() return base64_decode(data) end)
+        if ok and res then return res end
+    end
+    -- Fallback Lua Native Base64 Decoder
+    local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    data = string.gsub(data, "[^"..b.."=]", "")
+    local ok, res = pcall(function()
+        return (data:gsub(".", function(x)
+            if x == "=" then return "" end
+            local r, f = "", (b:find(x) - 1)
+            for i = 6, 1, -1 do
+                r = r .. (f % 2^i - f % 2^(i - 1) > 0 and "1" or "0")
+            end
+            return r
+        end):gsub("%d%d%d?%d?%d?%d?", function(x)
+            if #x ~= 8 then return "" end
+            local c = 0
+            for i = 1, 8 do
+                c = c + (x:sub(i, i) == "1" and 2^(8 - i) or 0)
+            end
+            return string.char(c)
+        end))
+    end)
+    return (ok and res) or ""
+end
+
+local function ResolveFloatingLogoAsset()
+    local customAssetFn = getcustomasset or getsynasset
+
+    -- 1. Prioritas: Cek apakah file lokal sudah ada di workspace executor
+    if customAssetFn then
+        if isfile and isfile(FLOATING_LOGO_LOCAL_PATH) then
+            local ok, asset = pcall(function() return customAssetFn(FLOATING_LOGO_LOCAL_PATH) end)
+            if ok and asset then return asset end
+        elseif isfile and isfile("claude_logo.png") then
+            local ok, asset = pcall(function() return customAssetFn("claude_logo.png") end)
+            if ok and asset then return asset end
+        end
+    end
+
+    -- 2. Jika ada URL online langsung yang ditentukan
+    if FLOATING_LOGO_URL and FLOATING_LOGO_URL ~= "" then
+        local req = (syn and syn.request) or http_request or request
+        if req and writefile and customAssetFn then
+            local ok, resp = pcall(function()
+                return req({ Url = FLOATING_LOGO_URL, Method = "GET" })
+            end)
+            if ok and resp and resp.Body and resp.StatusCode == 200 then
+                if makefolder and not isfolder("HiiHuu") then pcall(function() makefolder("HiiHuu") end) end
+                writefile(FLOATING_LOGO_LOCAL_PATH, resp.Body)
+                local assetOk, asset = pcall(function() return customAssetFn(FLOATING_LOGO_LOCAL_PATH) end)
+                if assetOk and asset then return asset end
+            end
+        end
+    end
+
+    -- 3. Ekstraksi otomatis dari Embedded Base64 jika file belum tersedia di device
+    if writefile and customAssetFn and FLOATING_LOGO_FALLBACK_B64 ~= "" then
+        pcall(function()
+            local decodedBytes = DecodeBase64(FLOATING_LOGO_FALLBACK_B64)
+            if decodedBytes and #decodedBytes > 100 then
+                if makefolder and not isfolder("HiiHuu") then pcall(function() makefolder("HiiHuu") end) end
+                writefile(FLOATING_LOGO_LOCAL_PATH, decodedBytes)
+            end
+        end)
+        if isfile and isfile(FLOATING_LOGO_LOCAL_PATH) then
+            local ok, asset = pcall(function() return customAssetFn(FLOATING_LOGO_LOCAL_PATH) end)
+            if ok and asset then return asset end
+        end
+    end
+
+    return ""
+end
+
+local FloatingLogoAsset = ResolveFloatingLogoAsset()
+
+-- Floating Minimize Icon Button (Squircle Claude 3D Logo)
+local MinimizePill = Instance.new("ImageButton")
 MinimizePill.Name = "MinimizePill"
-MinimizePill.Size = UDim2.new(0, 160, 0, 36)
+MinimizePill.Size = UDim2.new(0, 66, 0, 66)
 MinimizePill.Position = UDim2.new(0, 20, 0, 80)
-MinimizePill.BackgroundColor3 = Color3.fromRGB(22, 25, 32)
-MinimizePill.TextColor3 = Color3.fromRGB(255, 255, 255)
-MinimizePill.Font = Enum.Font.GothamBold
-MinimizePill.TextSize = 13
-MinimizePill.Text = "HiiiHuuu"
+MinimizePill.BackgroundTransparency = 1
 MinimizePill.Visible = false
+MinimizePill.Active = true
+MinimizePill.AutoButtonColor = false
 MinimizePill.Parent = ScreenGui
 
-local PillCorner = Instance.new("UICorner")
-PillCorner.CornerRadius = UDim.new(0, 18)
-PillCorner.Parent = MinimizePill
+if FloatingLogoAsset and FloatingLogoAsset ~= "" then
+    MinimizePill.Image = FloatingLogoAsset
+    MinimizePill.ScaleType = Enum.ScaleType.Fit
+else
+    -- Fallback visual jika getcustomasset tidak aktif
+    MinimizePill.BackgroundTransparency = 0
+    MinimizePill.BackgroundColor3 = Color3.fromRGB(218, 98, 62)
+    local FallbackCorner = Instance.new("UICorner", MinimizePill)
+    FallbackCorner.CornerRadius = UDim.new(0, 14)
 
-local PillStroke = Instance.new("UIStroke")
-PillStroke.Color = Color3.fromRGB(39, 174, 96)
-PillStroke.Thickness = 1.5
-PillStroke.Parent = MinimizePill
+    local FallbackStroke = Instance.new("UIStroke", MinimizePill)
+    FallbackStroke.Color = Color3.fromRGB(240, 140, 100)
+    FallbackStroke.Thickness = 1.5
+
+    local FallbackIcon = Instance.new("TextLabel")
+    FallbackIcon.Size = UDim2.new(1, 0, 1, 0)
+    FallbackIcon.BackgroundTransparency = 1
+    FallbackIcon.Text = "✻"
+    FallbackIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FallbackIcon.Font = Enum.Font.GothamBold
+    FallbackIcon.TextSize = 28
+    FallbackIcon.Parent = MinimizePill
+end
+
+-- Hover Smooth Tweening
+MinimizePill.MouseEnter:Connect(function()
+    pcall(function()
+        TweenService:Create(MinimizePill, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 58, 0, 58),
+            Position = MinimizePill.Position + UDim2.new(0, -3, 0, -3)
+        }):Play()
+    end)
+end)
+
+MinimizePill.MouseLeave:Connect(function()
+    pcall(function()
+        TweenService:Create(MinimizePill, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 52, 0, 52),
+            Position = MinimizePill.Position + UDim2.new(0, 3, 0, 3)
+        }):Play()
+    end)
+end)
 
 -- Dragging Engine untuk MainFrame & MinimizePill
 local function MakeDraggable(guiObject)
     local dragging = false
     local dragInput, dragStart, startPos
+    local hasMoved = false
 
     guiObject.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
+            hasMoved = false
             dragStart = input.Position
             startPos = guiObject.Position
 
@@ -1458,6 +1785,9 @@ local function MakeDraggable(guiObject)
     UserInputService.InputChanged:Connect(function(input)
         if input == dragInput and dragging then
             local delta = input.Position - dragStart
+            if math.abs(delta.X) > 6 or math.abs(delta.Y) > 6 then
+                hasMoved = true
+            end
             guiObject.Position = UDim2.new(
                 startPos.X.Scale,
                 startPos.X.Offset + delta.X,
@@ -1466,10 +1796,14 @@ local function MakeDraggable(guiObject)
             )
         end
     end)
+
+    return function()
+        return hasMoved
+    end
 end
 
-MakeDraggable(MainFrame)
-MakeDraggable(MinimizePill)
+local _isMainDragged = MakeDraggable(MainFrame)
+local isPillDragged = MakeDraggable(MinimizePill)
 
 -- Header Bar
 local Header = Instance.new("Frame")
@@ -1488,10 +1822,10 @@ HeaderTitle.Size = UDim2.new(1, -80, 1, 0)
 HeaderTitle.Position = UDim2.new(0, 12, 0, 0)
 HeaderTitle.BackgroundTransparency = 1
 HeaderTitle.Font = Enum.Font.GothamBold
-HeaderTitle.TextSize = 14
+HeaderTitle.TextSize = 13
 HeaderTitle.TextColor3 = Color3.fromRGB(240, 245, 255)
 HeaderTitle.TextXAlignment = Enum.TextXAlignment.Left
-HeaderTitle.Text = "HiiiHuuu ANUBIS EVENT"
+HeaderTitle.Text = "AUTO ANUBIS EVENT"
 HeaderTitle.Parent = Header
 
 local MinBtn = Instance.new("TextButton")
@@ -1526,25 +1860,103 @@ MinBtn.MouseButton1Click:Connect(function()
 end)
 
 MinimizePill.MouseButton1Click:Connect(function()
+    if isPillDragged and isPillDragged() then return end
     MinimizePill.Visible = false
     MainFrame.Visible = true
 end)
 
 CloseBtn.MouseButton1Click:Connect(function()
     ScreenGui:Destroy()
-    if getgenv then getgenv().HUKI_ArchieCollector_Gui = nil end
+    if getgenv then getgenv().HiiHuu_ArchieCollector_Gui = nil end
 end)
 
--- Content ScrollFrame
-local Content = Instance.new("ScrollingFrame")
+-- Tab Navigation Bar (ARCHIE vs TRADER TINA)
+local TabBar = Instance.new("Frame")
+TabBar.Name = "TabBar"
+TabBar.Size = UDim2.new(1, -16, 0, 32)
+TabBar.Position = UDim2.new(0, 8, 0, 46)
+TabBar.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
+TabBar.BorderSizePixel = 0
+TabBar.Parent = MainFrame
+
+local TabBarCorner = Instance.new("UICorner")
+TabBarCorner.CornerRadius = UDim.new(0, 8)
+TabBarCorner.Parent = TabBar
+
+local TabArchieBtn = Instance.new("TextButton")
+TabArchieBtn.Name = "TabArchieBtn"
+TabArchieBtn.Size = UDim2.new(0.5, -3, 1, -4)
+TabArchieBtn.Position = UDim2.new(0, 2, 0, 2)
+TabArchieBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
+TabArchieBtn.Font = Enum.Font.GothamBold
+TabArchieBtn.TextSize = 11
+TabArchieBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+TabArchieBtn.Text = "ARCHIE COLLECTOR"
+TabArchieBtn.Parent = TabBar
+
+local TabArchieCorner = Instance.new("UICorner")
+TabArchieCorner.CornerRadius = UDim.new(0, 6)
+TabArchieCorner.Parent = TabArchieBtn
+
+local TabTinaBtn = Instance.new("TextButton")
+TabTinaBtn.Name = "TabTinaBtn"
+TabTinaBtn.Size = UDim2.new(0.5, -3, 1, -4)
+TabTinaBtn.Position = UDim2.new(0.5, 1, 0, 2)
+TabTinaBtn.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+TabTinaBtn.Font = Enum.Font.GothamBold
+TabTinaBtn.TextSize = 11
+TabTinaBtn.TextColor3 = Color3.fromRGB(160, 170, 190)
+TabTinaBtn.Text = "TRADER TINA"
+TabTinaBtn.Parent = TabBar
+
+local TabTinaCorner = Instance.new("UICorner")
+TabTinaCorner.CornerRadius = UDim.new(0, 6)
+TabTinaCorner.Parent = TabTinaBtn
+
+-- Forward declarations untuk Tab Content ScrollingFrames
+local Content
+local TinaContent
+
+local function SwitchTab(tabName)
+    State.ActiveTab = tabName
+    if tabName == "Archie" then
+        TabArchieBtn.BackgroundColor3 = Color3.fromRGB(39, 174, 96)
+        TabArchieBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TabTinaBtn.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+        TabTinaBtn.TextColor3 = Color3.fromRGB(160, 170, 190)
+        if Content then Content.Visible = true end
+        if TinaContent then TinaContent.Visible = false end
+    else
+        TabTinaBtn.BackgroundColor3 = Color3.fromRGB(212, 160, 23)
+        TabTinaBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TabArchieBtn.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+        TabArchieBtn.TextColor3 = Color3.fromRGB(160, 170, 190)
+        if Content then Content.Visible = false end
+        if TinaContent then TinaContent.Visible = true end
+        if UpdateTinaCoinsDisplay then UpdateTinaCoinsDisplay() end
+        if UpdateTinaCheckboxes then UpdateTinaCheckboxes() end
+    end
+end
+
+TabArchieBtn.MouseButton1Click:Connect(function()
+    SwitchTab("Archie")
+end)
+
+TabTinaBtn.MouseButton1Click:Connect(function()
+    SwitchTab("Tina")
+end)
+
+-- Content ScrollFrame (TAB 1: ARCHIE COLLECTOR)
+Content = Instance.new("ScrollingFrame")
 Content.Name = "Content"
-Content.Size = UDim2.new(1, -16, 1, -50)
-Content.Position = UDim2.new(0, 8, 0, 46)
+Content.Size = UDim2.new(1, -16, 1, -90)
+Content.Position = UDim2.new(0, 8, 0, 84)
 Content.BackgroundTransparency = 1
 Content.BorderSizePixel = 0
 Content.ScrollBarThickness = 4
 Content.ScrollBarImageColor3 = Color3.fromRGB(60, 70, 85)
-Content.CanvasSize = UDim2.new(0, 0, 0, 720)
+Content.CanvasSize = UDim2.new(0, 0, 0, 530)
+Content.Visible = true
 Content.Parent = MainFrame
 
 local ContentLayout = Instance.new("UIListLayout")
@@ -1869,69 +2281,283 @@ UpdateStatsDisplay = function()
     end)
 end
 
--- ============================================================================
--- SECTION 5: REAL-TIME ACTIVITY LOG VIEWER
--- ============================================================================
-local Section5 = CreateSection(5, 140)
-
-local LogTitle = Instance.new("TextLabel")
-LogTitle.Size = UDim2.new(1, -20, 0, 18)
-LogTitle.Position = UDim2.new(0, 10, 0, 6)
-LogTitle.BackgroundTransparency = 1
-LogTitle.Font = Enum.Font.GothamBold
-LogTitle.TextSize = 11
-LogTitle.TextColor3 = Color3.fromRGB(150, 165, 185)
-LogTitle.TextXAlignment = Enum.TextXAlignment.Left
-LogTitle.Text = "ACTIVITY LOG CONSOLE"
-LogTitle.Parent = Section5
-
-local LogScroll = Instance.new("ScrollingFrame")
-LogScroll.Size = UDim2.new(1, -20, 0, 106)
-LogScroll.Position = UDim2.new(0, 10, 0, 26)
-LogScroll.BackgroundColor3 = Color3.fromRGB(14, 16, 20)
-LogScroll.BorderSizePixel = 0
-LogScroll.ScrollBarThickness = 3
-LogScroll.ScrollBarImageColor3 = Color3.fromRGB(60, 70, 85)
-LogScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-LogScroll.Parent = Section5
-
-local LogScrollCorner = Instance.new("UICorner")
-LogScrollCorner.CornerRadius = UDim.new(0, 6)
-LogScrollCorner.Parent = LogScroll
-
-local LogLayout = Instance.new("UIListLayout")
-LogLayout.SortOrder = Enum.SortOrder.LayoutOrder
-LogLayout.Padding = UDim.new(0, 2)
-LogLayout.Parent = LogScroll
-
-local logEntries = {}
-local maxLogEntries = 50
-
+-- Log Activity dimatikan per permintaan user
 AppendLog = function(msg, color)
+    -- Disabled
+end
+
+-- ============================================================================
+-- TAB 2: USER INTERFACE TRADER TINA (ANUBIS COIN SHOP)
+-- ============================================================================
+TinaContent = Instance.new("ScrollingFrame")
+TinaContent.Name = "TinaContent"
+TinaContent.Size = UDim2.new(1, -16, 1, -90)
+TinaContent.Position = UDim2.new(0, 8, 0, 84)
+TinaContent.BackgroundTransparency = 1
+TinaContent.BorderSizePixel = 0
+TinaContent.ScrollBarThickness = 4
+TinaContent.ScrollBarImageColor3 = Color3.fromRGB(60, 70, 85)
+TinaContent.CanvasSize = UDim2.new(0, 0, 0, 540)
+TinaContent.Visible = false
+TinaContent.Parent = MainFrame
+
+local TinaLayout = Instance.new("UIListLayout")
+TinaLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TinaLayout.Padding = UDim.new(0, 8)
+TinaLayout.Parent = TinaContent
+
+local function CreateTinaSection(layoutOrder, height)
+    local section = Instance.new("Frame")
+    section.Size = UDim2.new(1, 0, 0, height)
+    section.BackgroundColor3 = Color3.fromRGB(24, 28, 36)
+    section.BorderSizePixel = 0
+    section.LayoutOrder = layoutOrder
+    section.Parent = TinaContent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = section
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(36, 42, 54)
+    stroke.Thickness = 1
+    stroke.Parent = section
+
+    return section
+end
+
+-- ----------------------------------------------------------------------------
+-- TINA SECTION 1: TOMBOL AKSI CEPAT (PILIH SEMUA, HAPUS SEMUA, BELI 1x)
+-- ----------------------------------------------------------------------------
+local TinaSection1 = CreateTinaSection(1, 44)
+
+local function CreateTinaBtn(xPos, width, text, bgCol, onClick)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, width, 0, 28)
+    btn.Position = UDim2.new(0, xPos, 0, 8)
+    btn.BackgroundColor3 = bgCol
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Text = text
+    btn.Parent = TinaSection1
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+
+    btn.MouseButton1Click:Connect(function()
+        task.spawn(function()
+            pcall(onClick)
+        end)
+    end)
+    return btn
+end
+
+-- 3 Tombol: Pilih Semua, Hapus Semua, Beli 1x Sekarang
+CreateTinaBtn(10, 105, "PILIH SEMUA", Color3.fromRGB(41, 128, 185), function()
+    for _, item in ipairs(TinaShopItems) do
+        Config.TinaSelectedItems[item.Name] = true
+    end
+    if UpdateTinaCheckboxes then UpdateTinaCheckboxes() end
+end)
+
+CreateTinaBtn(122, 105, "HAPUS SEMUA", Color3.fromRGB(140, 45, 50), function()
+    for _, item in ipairs(TinaShopItems) do
+        Config.TinaSelectedItems[item.Name] = false
+    end
+    if UpdateTinaCheckboxes then UpdateTinaCheckboxes() end
+end)
+
+CreateTinaBtn(234, 120, "BELI 1x SEKARANG", Color3.fromRGB(212, 160, 23), function()
+    BuyAllSelectedTinaItems()
+end)
+
+-- ----------------------------------------------------------------------------
+-- TINA SECTION 2: MULTI-SELECT CHECKBOX SELURUH 11 ITEM RESMI SHOP
+-- ----------------------------------------------------------------------------
+local TinaSection2 = CreateTinaSection(2, 376)
+
+local ItemsHeader = Instance.new("TextLabel")
+ItemsHeader.Size = UDim2.new(1, -20, 0, 20)
+ItemsHeader.Position = UDim2.new(0, 10, 0, 6)
+ItemsHeader.BackgroundTransparency = 1
+ItemsHeader.Font = Enum.Font.GothamBold
+ItemsHeader.TextSize = 11
+ItemsHeader.TextColor3 = Color3.fromRGB(180, 190, 210)
+ItemsHeader.TextXAlignment = Enum.TextXAlignment.Left
+ItemsHeader.Text = "MULTI-SELECT ITEM ANUBIS SHOP (11 ITEM):"
+ItemsHeader.Parent = TinaSection2
+
+local TinaCheckboxes = {}
+
+for idx, item in ipairs(TinaShopItems) do
+    local yPos = 28 + (idx - 1) * 31
+    local row = Instance.new("TextButton")
+    row.Name = "ItemRow_" .. item.Name
+    row.Size = UDim2.new(1, -20, 0, 28)
+    row.Position = UDim2.new(0, 10, 0, yPos)
+    row.BackgroundColor3 = (idx % 2 == 0) and Color3.fromRGB(19, 22, 28) or Color3.fromRGB(15, 17, 22)
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.Parent = TinaSection2
+
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 5)
+    rowCorner.Parent = row
+
+    -- Checkbox Button
+    local checkSquare = Instance.new("TextButton")
+    checkSquare.Size = UDim2.new(0, 20, 0, 20)
+    checkSquare.Position = UDim2.new(0, 5, 0, 4)
+    local isChecked = Config.TinaSelectedItems[item.Name] == true
+    checkSquare.BackgroundColor3 = isChecked and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(36, 42, 54)
+    checkSquare.Font = Enum.Font.GothamBold
+    checkSquare.TextSize = 13
+    checkSquare.TextColor3 = Color3.fromRGB(255, 255, 255)
+    checkSquare.Text = isChecked and "✓" or ""
+    checkSquare.Parent = row
+
+    local checkCorner = Instance.new("UICorner")
+    checkCorner.CornerRadius = UDim.new(0, 4)
+    checkCorner.Parent = checkSquare
+
+    TinaCheckboxes[item.Name] = checkSquare
+
+    -- Item Name Label
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Size = UDim2.new(0.48, 0, 1, 0)
+    nameLbl.Position = UDim2.new(0, 32, 0, 0)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Font = Enum.Font.GothamSemibold
+    nameLbl.TextSize = 11
+    nameLbl.TextColor3 = Color3.fromRGB(230, 235, 245)
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    nameLbl.Text = item.Name
+    nameLbl.Parent = row
+
+    -- Item Price & Type badge (bebas dari broken emoji)
+    local priceLbl = Instance.new("TextLabel")
+    priceLbl.Size = UDim2.new(0.48, -5, 1, 0)
+    priceLbl.Position = UDim2.new(0.52, 0, 0, 0)
+    priceLbl.BackgroundTransparency = 1
+    priceLbl.Font = Enum.Font.GothamBold
+    priceLbl.TextSize = 11
+    local rarityCol = RarityColorMap[item.Rarity] or Color3.fromRGB(241, 196, 15)
+    priceLbl.TextColor3 = rarityCol
+    priceLbl.TextXAlignment = Enum.TextXAlignment.Right
+    priceLbl.Text = string.format("[%s] %s Coins", item.Type, CommaNumber(item.Price))
+    priceLbl.Parent = row
+
+    -- Toggle Callback
+    local function ToggleThisItem()
+        local nextVal = not (Config.TinaSelectedItems[item.Name] == true)
+        Config.TinaSelectedItems[item.Name] = nextVal
+        checkSquare.BackgroundColor3 = nextVal and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(36, 42, 54)
+        checkSquare.Text = nextVal and "✓" or ""
+    end
+
+    row.MouseButton1Click:Connect(ToggleThisItem)
+    checkSquare.MouseButton1Click:Connect(ToggleThisItem)
+end
+
+UpdateTinaCheckboxes = function()
     pcall(function()
-        if not LogScroll or not LogScroll.Parent then return end
-        local timeStr = os.date("%H:%M:%S")
-        local entry = Instance.new("TextLabel")
-        entry.Size = UDim2.new(1, -6, 0, 16)
-        entry.BackgroundTransparency = 1
-        entry.Font = Enum.Font.Code
-        entry.TextSize = 10
-        entry.TextColor3 = color or Color3.fromRGB(220, 225, 235)
-        entry.TextXAlignment = Enum.TextXAlignment.Left
-        entry.Text = string.format("[%s] %s", timeStr, msg)
-        entry.LayoutOrder = #logEntries + 1
-        entry.Parent = LogScroll
-
-        table.insert(logEntries, entry)
-        if #logEntries > maxLogEntries then
-            local old = table.remove(logEntries, 1)
-            if old then old:Destroy() end
+        for itemName, checkBtn in pairs(TinaCheckboxes) do
+            local isSel = Config.TinaSelectedItems[itemName] == true
+            checkBtn.BackgroundColor3 = isSel and Color3.fromRGB(39, 174, 96) or Color3.fromRGB(36, 42, 54)
+            checkBtn.Text = isSel and "✓" or ""
         end
-
-        LogScroll.CanvasSize = UDim2.new(0, 0, 0, #logEntries * 18)
-        LogScroll.CanvasPosition = Vector2.new(0, math.max(0, #logEntries * 18 - 106))
     end)
 end
+
+-- ----------------------------------------------------------------------------
+-- TINA SECTION 3: NAVIGASI & REFRESH SHOP
+-- ----------------------------------------------------------------------------
+local TinaSection3 = CreateTinaSection(3, 46)
+
+local function CreateNavBtn(xPos, width, text, bgCol, onClick)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, width, 0, 30)
+    btn.Position = UDim2.new(0, xPos, 0, 8)
+    btn.BackgroundColor3 = bgCol
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Text = text
+    btn.Parent = TinaSection3
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+
+    btn.MouseButton1Click:Connect(function()
+        task.spawn(function()
+            pcall(onClick)
+        end)
+    end)
+    return btn
+end
+
+CreateNavBtn(10, 165, "TELEPORT KE TRADER TINA", Color3.fromRGB(142, 68, 173), function()
+    TeleportToTraderTina()
+end)
+
+local RefreshCoinsBtn
+RefreshCoinsBtn = CreateNavBtn(185, 165, "REFRESH KOIN & STOCK", Color3.fromRGB(52, 73, 94), function()
+    if UpdateTinaCoinsDisplay then UpdateTinaCoinsDisplay() end
+    if UpdateTinaCheckboxes then UpdateTinaCheckboxes() end
+end)
+
+UpdateTinaCoinsDisplay = function()
+    pcall(function()
+        if RefreshCoinsBtn and RefreshCoinsBtn.Parent then
+            local coins = GetAnubisCoins()
+            RefreshCoinsBtn.Text = string.format("REFRESH (%s COINS)", CommaNumber(coins))
+        end
+    end)
+end
+
+-- ----------------------------------------------------------------------------
+-- TINA SECTION 4: TOGGLE AUTO BUY PINDAH KE BAWAH (TEMPAT LOG ACTIVITY LAMA)
+-- ----------------------------------------------------------------------------
+local TinaSection4 = CreateTinaSection(4, 46)
+
+local AutoBuyRow = Instance.new("Frame")
+AutoBuyRow.Size = UDim2.new(1, -20, 0, 30)
+AutoBuyRow.Position = UDim2.new(0, 10, 0, 8)
+AutoBuyRow.BackgroundTransparency = 1
+AutoBuyRow.Parent = TinaSection4
+
+local AutoBuyLbl = Instance.new("TextLabel")
+AutoBuyLbl.Size = UDim2.new(1, -66, 1, 0)
+AutoBuyLbl.BackgroundTransparency = 1
+AutoBuyLbl.Font = Enum.Font.GothamBold
+AutoBuyLbl.TextSize = 11
+AutoBuyLbl.TextColor3 = Color3.fromRGB(220, 225, 235)
+AutoBuyLbl.TextXAlignment = Enum.TextXAlignment.Left
+AutoBuyLbl.Text = "Auto Buy Selected Stock (Loop)"
+AutoBuyLbl.Parent = AutoBuyRow
+
+local AutoBuyBtn = Instance.new("TextButton")
+AutoBuyBtn.Size = UDim2.new(0, 56, 0, 26)
+AutoBuyBtn.Position = UDim2.new(1, -56, 0, 2)
+AutoBuyBtn.BackgroundColor3 = Config.TinaAutoBuy and Color3.fromRGB(212, 160, 23) or Color3.fromRGB(48, 54, 68)
+AutoBuyBtn.Font = Enum.Font.GothamBold
+AutoBuyBtn.TextSize = 11
+AutoBuyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoBuyBtn.Text = Config.TinaAutoBuy and "ON" or "OFF"
+AutoBuyBtn.Parent = AutoBuyRow
+
+local AutoBuyCorner = Instance.new("UICorner")
+AutoBuyCorner.CornerRadius = UDim.new(0, 12)
+AutoBuyCorner.Parent = AutoBuyBtn
+
+AutoBuyBtn.MouseButton1Click:Connect(function()
+    Config.TinaAutoBuy = not Config.TinaAutoBuy
+    AutoBuyBtn.Text = Config.TinaAutoBuy and "ON" or "OFF"
+    AutoBuyBtn.BackgroundColor3 = Config.TinaAutoBuy and Color3.fromRGB(212, 160, 23) or Color3.fromRGB(48, 54, 68)
+end)
 
 -- Inisialisasi Pertama
 task.spawn(function()
@@ -1945,10 +2571,11 @@ task.spawn(function()
     if CheckAndSubmitBackpackFruits then
         CheckAndSubmitBackpackFruits()
     end
-    AppendLog("Script Auto Collect Archie siap digunakan!", Color3.fromRGB(0, 255, 170))
-    AppendLog(string.format("Kebutuhan Archie saat ini: [%s]", State.CurrentArchieTrait or "Fruit"), TraitColorMap[State.CurrentArchieTrait] or Color3.fromRGB(255, 255, 255))
-    if Config.SkipRewardAnimation then
-        AppendLog("[REWARD] Bypass animasi opening reward ('Brushed Up') aktif!", Color3.fromRGB(255, 215, 0))
+    if UpdateTinaCoinsDisplay then
+        pcall(UpdateTinaCoinsDisplay)
+    end
+    if UpdateTinaCheckboxes then
+        pcall(UpdateTinaCheckboxes)
     end
 end)
 
