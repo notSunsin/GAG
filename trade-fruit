@@ -1,0 +1,2130 @@
+--[[
+    ========================================================================================
+    HUKI - GROW A GARDEN (GAG) | AUTO FRUIT TRADE GIFTER
+    Multi-Fruit & Mutation Filtered Auto Gifting via Trade Ticket
+    ----------------------------------------------------------------------------------------
+    Target Game     : Grow A Garden (GAG)
+    Compatibility   : Potassium / Delta Mobile / Solara / Wave / Arceus X / PC & Mobile
+    Architecture    : Native Luau, Anti-Throttle Engine, PlayerGui Safe Parent, 100% Plain ASCII
+    
+    PERBAIKAN TERBARU:
+    1. FIX CAPABILITY PLUGIN ERROR:
+       - Memastikan seluruh GUI diparenting ke LocalPlayer.PlayerGui (bukan CoreGui/gethui
+         yang menyebabkan "cannot access Instance lacking capability Plugin" pada Potassium).
+       - Seluruh pembaruan UI dibungkus pcall agar thread trade tidak pernah crash.
+    2. FIX BUAH TIDAK TER-ADD SETELAH ACC TICKET:
+       - Mengirimkan TradeEvents.AddItem secara langsung via remote dengan itemType ("Holdable")
+         dan itemUUID ("c"), melewati batasan flag u20 internal game.
+       - Menambahkan inisialisasi jeda 0.3s saat trade terbuka agar replicator data tersinkronisasi.
+       - Log progress real-time per buah yang masuk ke offer (misal: "[INSERT] + Coconut (1/12)").
+    ========================================================================================
+]]
+
+-- ========================================================================================
+-- 1. SERVICE & INISIALISASI DASAR
+-- ========================================================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- Deteksi Container GUI yang Aman (PlayerGui menjamin 100% bebas error capability di Potassium)
+local function GetSafeGuiParent()
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if pgui then return pgui end
+
+    local ok, res = pcall(function()
+        return LocalPlayer:WaitForChild("PlayerGui", 5)
+    end)
+    if ok and res then return res end
+
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- Bersihkan instance GUI lama jika sudah aktif
+if getgenv and getgenv().HUKI_FruitGifter_Gui then
+    pcall(function()
+        getgenv().HUKI_FruitGifter_Gui:Destroy()
+    end)
+    getgenv().HUKI_FruitGifter_Gui = nil
+end
+
+pcall(function()
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if pgui then
+        for _, child in ipairs(pgui:GetChildren()) do
+            if child.Name == "HUKI_FruitGifter_Gui" then
+                child:Destroy()
+            end
+        end
+    end
+end)
+
+-- ========================================================================================
+-- 2. REFERENSI REMOTE & MODUL RESMI GAME GAG
+-- ========================================================================================
+local GameEvents = ReplicatedStorage:WaitForChild("GameEvents", 10)
+local TradeEvents = GameEvents and GameEvents:WaitForChild("TradeEvents", 10)
+
+-- Remote Trade Plaza
+local SendRequestRemote = TradeEvents and TradeEvents:WaitForChild("SendRequest", 10)
+local RespondRequestRemote = TradeEvents and TradeEvents:WaitForChild("RespondRequest", 10)
+local AddItemRemote = TradeEvents and TradeEvents:WaitForChild("AddItem", 10)
+local RemoveItemRemote = TradeEvents and TradeEvents:WaitForChild("RemoveItem", 10)
+local AcceptRemote = TradeEvents and TradeEvents:WaitForChild("Accept", 10)
+local ConfirmRemote = TradeEvents and TradeEvents:WaitForChild("Confirm", 10)
+local DeclineRemote = TradeEvents and TradeEvents:WaitForChild("Decline", 10)
+local UpdateTradeStateRemote = TradeEvents and TradeEvents:WaitForChild("UpdateTradeState", 10)
+
+-- Modul Internal Game
+local ModulesFolder = ReplicatedStorage:WaitForChild("Modules", 10)
+local DataFolder = ReplicatedStorage:WaitForChild("Data", 10)
+
+local TradingController = nil
+local TradeRequestController = nil
+local TradeData = nil
+local MutationHandler = nil
+local InventoryServiceEnums = nil
+local ReversedItemTypeEnums = nil
+local SeedData = nil
+
+pcall(function()
+    TradingController = require(ModulesFolder.TradeControllers.TradingController)
+end)
+pcall(function()
+    TradeRequestController = require(ModulesFolder.TradeControllers.TradeRequestController)
+end)
+pcall(function()
+    TradeData = require(DataFolder.TradeData)
+end)
+pcall(function()
+    MutationHandler = require(ModulesFolder:WaitForChild("MutationHandler", 5))
+end)
+pcall(function()
+    InventoryServiceEnums = require(DataFolder.EnumRegistry.InventoryServiceEnums)
+end)
+pcall(function()
+    ReversedItemTypeEnums = require(DataFolder.EnumRegistry.ReversedItemTypeEnums)
+end)
+pcall(function()
+    SeedData = require(DataFolder.SeedData)
+end)
+
+-- ========================================================================================
+-- 3. DAFTAR MUTASI STANDAR
+-- ========================================================================================
+local KNOWN_MUTATIONS = {
+    "Hieroglyphic",
+    "Gold",
+    "Rainbow",
+    "Nightmare",
+    "Wet",
+    "Drenched",
+    "Shocked",
+    "Bloodlit",
+    "Moonlit",
+    "Burnt",
+    "Cooked",
+    "Fried",
+    "Frozen",
+    "Chilled",
+    "Clay",
+    "Ceramic",
+    "Amber",
+    "Ancient Amber",
+    "Verdant",
+    "Paradisal",
+    "Sundried",
+    "Sandy",
+    "Desolate",
+    "Wilted"
+}
+
+-- ========================================================================================
+-- 4. STATE & KONFIGURASI APLIKASI
+-- ========================================================================================
+local Config = {
+    -- PENGIRIM
+    TargetPlayerName = "",             -- Nama recipient (@Username atau DisplayName)
+    SelectedFruits = {},               -- [FruitName] = true
+    SelectAllFruits = true,            -- Default kirim semua jenis buah terpilih
+    SelectedMutations = {              -- Filter mutasi yang diizinkan
+        ["All"] = true,
+        ["Normal"] = true,
+        ["Hieroglyphic"] = true,
+        ["Gold"] = true,
+        ["Rainbow"] = true,
+        ["Nightmare"] = true,
+    },
+    AutoGift = false,                  -- Toggle Loop Auto Gift
+    SkipFavorited = true,              -- Lewatkan buah yang dikunci/favorit
+    AutoStandNearTarget = true,        -- Otomatis mendekat ke penerima saat kirim request
+    AddFruitDelay = 0.08,              -- Jeda memasukkan item (detik)
+    ButtonCooldownWait = 5.2,          -- Cooldown tombol Confirm game (5s + buffer)
+
+    -- PENERIMA
+    AutoAccTrade = false,              -- Checkbox Auto Acc Trade
+    ReceiverOnlyFromTarget = false,    -- Batasi hanya terima dari target pengirim (jika diisi)
+}
+
+local State = {
+    ActiveTab = "Pengirim",            -- "Pengirim" atau "Penerima"
+    CurrentTradeId = nil,
+    PartnerPlayer = nil,
+    IsTradeActive = false,
+    IsWorkerRunning = false,
+    TotalGiftedCount = 0,
+    HasTradingTicket = false,
+    DiscoveredFruits = {},             -- Daftar seluruh jenis buah yang ada di tas player
+    BagFruitCounts = {},               -- [FruitName] = total unit di tas
+    IsLoopRunning = false,
+}
+
+-- Forward declarations fungsi UI & Worker
+local AppendLog = nil
+local UpdateStatusUI = nil
+local RefreshFruitDropdownUI = nil
+local RefreshMutationDropdownUI = nil
+local RefreshPlayerDropdownUI = nil
+local ScanBackpackFruits = nil
+
+-- ========================================================================================
+-- 5. UTILITIES DETEKSI BUAH & MUTASI
+-- ========================================================================================
+
+-- Ambil UUID tool secara lengkap
+local function GetItemUUID(tool)
+    if not tool then return nil end
+    local uuid = tool:GetAttribute("c")
+        or tool:GetAttribute("ITEM_UUID")
+        or tool:GetAttribute("UUID")
+        or (InventoryServiceEnums and tool:GetAttribute(InventoryServiceEnums.ITEM_UUID))
+        or tool:GetAttribute("PET_UUID")
+    return uuid
+end
+
+-- Ekstrak nama buah dasar tanpa mutasi dan berat
+local function ExtractCleanFruitName(rawName)
+    local s = tostring(rawName or "")
+    s = s:gsub("%b[]", "") -- Buang tag bracket [Hieroglyphic], [10.5kg]
+    s = s:gsub("%b()", "")
+
+    for _, m in ipairs(KNOWN_MUTATIONS) do
+        s = s:gsub(m, "")
+    end
+
+    s = s:gsub("[%d%.]+%s*kg", "") -- Buang berat seperti 15.2kg
+    s = s:gsub("^%s+", ""):gsub("%s+$", "") -- Trim
+
+    if s == "" then
+        s = rawName
+    end
+    return s
+end
+
+-- Deteksi apakah tool adalah item buah panen (bukan gear/ticket/pet/seed)
+local function IsFruitTool(tool)
+    if not (tool and tool:IsA("Tool")) then return false end
+
+    -- Abaikan jika Pet
+    if tool:GetAttribute("PET_UUID") or tool:GetAttribute("PetUUID") or tool:HasTag("PetTool") then
+        return false
+    end
+
+    local rawName = tool.Name
+    local lowerName = string.lower(rawName)
+
+    -- 2. Blacklist spesifik item yang bukan buah / tidak dapat di-gift (makanan olahan, gear, event item)
+    local blacklist = {
+        -- Non-fruit / untradeable items:
+        "bonfire", "cake", "fairy targeter", "targeter", "hotdog", "smoothie",
+        "star caller", "star caler", "yule log",
+
+        -- Alat, Ticket, Benih, Gear, Crate, Potion:
+        "trading ticket", "trade ticket", "ticket", "watering", "can", "sprinkler",
+        "shears", "shovel", "radar", "staff", "fertilizer", "potion", "rod", "egg",
+        "seed", "crate", "trowel", "basket", "backpack", "blower", "net", "jar",
+        "lantern", "flute", "whistle", "totem", "scroll", "compass", "wrench", "pouch",
+        "caller", "wand", "kite", "extender", "summoner",
+
+        -- Makanan olahan / Masakan (Food / Non-fruit dishes):
+        "burger", "soup", "sandwich", "pie", "cookie", "bread", "pizza", "salad",
+        "dish", "meal", "coffee", "tea", "candy", "chocolate", "stew", "pancake", "waffle"
+    }
+    for _, word in ipairs(blacklist) do
+        if string.find(lowerName, word, 1, true) then
+            return false
+        end
+    end
+
+    -- 3. Cek apakah bertipe Food ("u") dari Enum ItemType (makanan olahan tidak dapat di-gift sebagai buah)
+    local itemTypeAttr = tool:GetAttribute("b") or tool:GetAttribute("ITEM_TYPE")
+    if itemTypeAttr == "u" or itemTypeAttr == "Food" then
+        return false
+    end
+
+    -- 4. Indikator Pasti Buah Hasil Panen di GAG:
+    -- A. Cek FruitVersion attribute ("s") - ciri khas utama buah panen GAG
+    if tool:GetAttribute("s") or tool:GetAttribute("FruitVersion") then
+        local nameAttr = tool:GetAttribute("f") or tool:GetAttribute("ItemName") or rawName
+        return true, tostring(nameAttr)
+    end
+
+    -- B. Cek Item_String (ciri khas panen tanaman GAG)
+    local itemStr = tool:FindFirstChild("Item_String")
+    if itemStr and itemStr.Value and itemStr.Value ~= "" then
+        local val = tostring(itemStr.Value)
+        for _, word in ipairs(blacklist) do
+            if string.find(string.lower(val), word, 1, true) then
+                return false
+            end
+        end
+        return true, val
+    end
+
+    -- C. Cek PlantType / FruitType
+    local pType = tool:GetAttribute("PlantType") or tool:GetAttribute("FruitType")
+    if pType and type(pType) == "string" and pType ~= "" then
+        for _, word in ipairs(blacklist) do
+            if string.find(string.lower(pType), word, 1, true) then
+                return false
+            end
+        end
+        return true, pType
+    end
+
+    -- D. Cek dengan SeedData resmi game (harus terdaftar di data benih/tanaman)
+    local cleanName = ExtractCleanFruitName(rawName)
+    if SeedData and (SeedData[cleanName] or SeedData[rawName]) then
+        return true, cleanName
+    end
+
+    -- E. Cek atribut Berat buah (Weight / FruitWeight)
+    if tool:GetAttribute("Weight") or tool:GetAttribute("FruitWeight") or tool:GetAttribute("BaseWeight") then
+        local nameAttr = tool:GetAttribute("f") or tool:GetAttribute("ItemName") or cleanName
+        return true, tostring(nameAttr)
+    end
+
+    return false, rawName
+end
+
+-- Ekstrak daftar mutasi pada suatu tool buah
+local function ExtractFruitMutations(tool)
+    local muts = {}
+    local rawName = tool.Name
+    local lowerName = string.lower(rawName)
+
+    -- 1. Cek dari nama tool
+    for _, m in ipairs(KNOWN_MUTATIONS) do
+        if string.find(lowerName, string.lower(m), 1, true) then
+            if not table.find(muts, m) then table.insert(muts, m) end
+        end
+    end
+
+    -- 2. Cek Attributes
+    for attr, val in pairs(tool:GetAttributes()) do
+        local lAttr = string.lower(tostring(attr))
+        for _, m in ipairs(KNOWN_MUTATIONS) do
+            if lAttr == string.lower(m) and (val == true or val == 1 or type(val) == "string") then
+                if not table.find(muts, m) then table.insert(muts, m) end
+            end
+        end
+        if type(val) == "string" then
+            local lVal = string.lower(val)
+            for _, m in ipairs(KNOWN_MUTATIONS) do
+                if string.find(lVal, string.lower(m), 1, true) then
+                    if not table.find(muts, m) then table.insert(muts, m) end
+                end
+            end
+        end
+    end
+
+    -- 3. Cek Tag CollectionService
+    for _, tag in ipairs(CollectionService:GetTags(tool)) do
+        local lTag = string.lower(tag)
+        for _, m in ipairs(KNOWN_MUTATIONS) do
+            if lTag == string.lower(m) then
+                if not table.find(muts, m) then table.insert(muts, m) end
+            end
+        end
+    end
+
+    -- 4. Cek Modul MutationHandler jika ada
+    if MutationHandler and MutationHandler.GetPlantMutations then
+        pcall(function()
+            local list = MutationHandler:GetPlantMutations(tool, true)
+            if type(list) == "table" then
+                for _, mName in ipairs(list) do
+                    if not table.find(muts, tostring(mName)) then
+                        table.insert(muts, tostring(mName))
+                    end
+                end
+            end
+        end)
+    end
+
+    local isNormal = (#muts == 0)
+    return muts, isNormal
+end
+
+-- Pindai seluruh buah di ransel player
+ScanBackpackFruits = function()
+    local fruits = {}
+    local discovered = {}
+    local counts = {}
+
+    local containers = { LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }
+    local idx = 0
+
+    for _, container in ipairs(containers) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                idx = idx + 1
+                local isFruit, baseNameHint = IsFruitTool(item)
+                if isFruit then
+                    local cleanName = ExtractCleanFruitName(baseNameHint or item.Name)
+                    local muts, isNormal = ExtractFruitMutations(item)
+                    local isFav = item:GetAttribute("Favorite") == true
+                        or item:GetAttribute("IsFavorite") == true
+                        or item:GetAttribute("d") == true
+                    local uuid = GetItemUUID(item)
+
+                    table.insert(fruits, {
+                        Tool = item,
+                        RawName = item.Name,
+                        CleanName = cleanName,
+                        Mutations = muts,
+                        IsNormal = isNormal,
+                        IsFavorite = isFav,
+                        UUID = uuid,
+                        Index = idx
+                    })
+
+                    discovered[cleanName] = true
+                    counts[cleanName] = (counts[cleanName] or 0) + 1
+                end
+            end
+        end
+    end
+
+    -- HANYA menampilkan buah yang benar-benar ada di dalam tas (stok > 0)
+    local discList = {}
+    for fName, cnt in pairs(counts) do
+        if cnt > 0 then
+            table.insert(discList, fName)
+        end
+    end
+    table.sort(discList)
+
+    State.DiscoveredFruits = discList
+    State.BagFruitCounts = counts
+
+    return fruits
+end
+
+-- Cek apakah buah memenuhi kriteria Pemilihan Buah & Filter Mutasi
+local function IsFruitEligible(fruitInfo)
+    -- 1. Cek proteksi favorit
+    if Config.SkipFavorited and fruitInfo.IsFavorite then
+        return false
+    end
+
+    -- 2. Cek Pemilihan Buah
+    if not Config.SelectAllFruits then
+        local allowedFruit = Config.SelectedFruits[fruitInfo.CleanName]
+        if not allowedFruit then
+            return false
+        end
+    end
+
+    -- 3. Cek Filter Mutasi
+    if Config.SelectedMutations["All"] == true then
+        return true
+    end
+
+    -- Jika buah polos (tanpa mutasi)
+    if fruitInfo.IsNormal then
+        return Config.SelectedMutations["Normal"] == true
+    end
+
+    -- Jika memiliki mutasi, cek apakah salah satu mutasinya dicentang
+    for _, mut in ipairs(fruitInfo.Mutations) do
+        if Config.SelectedMutations[mut] == true then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- ========================================================================================
+-- 6. PENGELOLAAN TRADING TICKET & PLAYER UTILITIES
+-- ========================================================================================
+
+-- Cari item Trading Ticket di Backpack / Karakter
+local function GetTradingTicketTool()
+    local containers = { LocalPlayer.Character, LocalPlayer:FindFirstChild("Backpack") }
+    for _, cont in ipairs(containers) do
+        if cont then
+            for _, item in ipairs(cont:GetChildren()) do
+                if item:IsA("Tool") then
+                    local s = string.lower(item.Name)
+                    if string.find(s, "trading ticket", 1, true)
+                        or string.find(s, "trade ticket", 1, true)
+                        or string.find(s, "ticket", 1, true) then
+                        return item
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Pegang Trading Ticket di tangan
+local function HoldTradingTicket()
+    local tool = GetTradingTicketTool()
+    if not tool then
+        State.HasTradingTicket = false
+        return false, "Trading Ticket tidak ditemukan di Backpack atau Karakter!"
+    end
+
+    State.HasTradingTicket = true
+    if tool.Parent == LocalPlayer.Character then
+        return true, "Trading Ticket sudah dipegang."
+    end
+
+    local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid:UnequipTools()
+        task.wait(0.08)
+        humanoid:EquipTool(tool)
+        task.wait(0.12)
+        return true, "Berhasil memegang Trading Ticket."
+    else
+        tool.Parent = LocalPlayer.Character
+        task.wait(0.1)
+        return true, "Berhasil memegang Trading Ticket."
+    end
+end
+
+-- Temukan player target berdasarkan input nama (Aman dari capability restriction)
+local function FindPlayerByName(query)
+    if not query or query == "" then return nil end
+    local clean = string.lower(string.gsub(query, "^@", ""))
+
+    local allPlayers = {}
+    pcall(function()
+        allPlayers = Players:GetPlayers()
+    end)
+
+    -- Match exact Name / DisplayName
+    for _, plr in ipairs(allPlayers) do
+        local pName, pDisp = "", ""
+        pcall(function()
+            pName = plr.Name
+            pDisp = plr.DisplayName
+        end)
+        if plr ~= LocalPlayer and pName ~= "" then
+            if string.lower(pName) == clean or string.lower(pDisp) == clean then
+                return plr
+            end
+        end
+    end
+
+    -- Match substring
+    for _, plr in ipairs(allPlayers) do
+        local pName, pDisp = "", ""
+        pcall(function()
+            pName = plr.Name
+            pDisp = plr.DisplayName
+        end)
+        if plr ~= LocalPlayer and pName ~= "" then
+            if string.find(string.lower(pName), clean, 1, true) or string.find(string.lower(pDisp), clean, 1, true) then
+                return plr
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Posisi berdiri dekat target player
+local function StandNearPlayer(targetPlr)
+    if not targetPlr then return false end
+    local myChar = LocalPlayer.Character
+    local tChar = targetPlr.Character
+    if not myChar or not tChar then return false end
+
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart") or myChar.PrimaryPart
+    local tRoot = tChar:FindFirstChild("HumanoidRootPart") or tChar.PrimaryPart
+    if not myRoot or not tRoot then return false end
+
+    local dist = (myRoot.Position - tRoot.Position).Magnitude
+    if dist > 4.5 then
+        local lookVec = tRoot.CFrame.LookVector
+        local targetPos = tRoot.Position + (lookVec * 3.0)
+        myRoot.CFrame = CFrame.new(targetPos, tRoot.Position)
+        task.wait(0.12)
+    end
+    return true
+end
+
+-- ========================================================================================
+-- 7. SISTEM TRADE (MEMASUKKAN BUAH SECARA LANGSUNG, ACCEPT, & CONFIRM)
+-- ========================================================================================
+
+-- Masukkan 1 tool buah ke dalam trade offer secara langsung
+local function AddFruitToTrade(tool, uuid)
+    if not tool then return false end
+    uuid = uuid or GetItemUUID(tool)
+    if not uuid then return false end
+
+    -- Tentukan ItemType ("Holdable" adalah default buah di GAG)
+    local itemTypeAttr = tool:GetAttribute("b") or tool:GetAttribute("ITEM_TYPE")
+    local itemType = "Holdable"
+    if itemTypeAttr and ReversedItemTypeEnums and ReversedItemTypeEnums[itemTypeAttr] then
+        itemType = ReversedItemTypeEnums[itemTypeAttr]
+    end
+
+    local sent = false
+
+    -- 1. Direct Remote Call ke AddItem (paling handal & tidak terblokir upvalue u20 controller)
+    if AddItemRemote then
+        local ok, _ = pcall(function()
+            AddItemRemote:FireServer(itemType, uuid)
+        end)
+        if ok then sent = true end
+    end
+
+    -- 2. Controller AddItem Fallback
+    if not sent and TradingController and TradingController.AddItem then
+        local ok, _ = pcall(function()
+            TradingController:AddItem(itemType, uuid)
+        end)
+        if ok then sent = true end
+    end
+
+    -- 3. Controller AddFromTool Fallback
+    pcall(function()
+        if TradingController and TradingController.AddFromTool then
+            TradingController:AddFromTool(tool)
+        end
+    end)
+
+    return sent
+end
+
+-- Worker Sesi Trade Aktif (Koordinator Pengirim & Penerima)
+local function HandleActiveTradeSession(tradeReplicator)
+    if State.IsWorkerRunning then return end
+    State.IsWorkerRunning = true
+
+    task.spawn(function()
+        task.wait(0.3) -- Jeda inisialisasi trade state
+
+        local dataAsync = nil
+        pcall(function()
+            if tradeReplicator and tradeReplicator.GetDataAsync then
+                dataAsync = tradeReplicator:GetDataAsync(5)
+            elseif TradingController and TradingController.CurrentTradeReplicator then
+                dataAsync = TradingController.CurrentTradeReplicator:GetDataAsync(5)
+            end
+        end)
+
+        if not dataAsync or not dataAsync.players then
+            State.IsWorkerRunning = false
+            return
+        end
+
+        local myIdx = table.find(dataAsync.players, LocalPlayer)
+        if not myIdx then
+            State.IsWorkerRunning = false
+            return
+        end
+
+        local partnerIdx = (myIdx == 1) and 2 or 1
+        local partnerPlayer = dataAsync.players[partnerIdx]
+        State.PartnerPlayer = partnerPlayer
+        local partnerName = partnerPlayer and partnerPlayer.Name or "Partner"
+
+        AppendLog(string.format("[TRADE AKTIF] Bersama @%s!", partnerName), Color3.fromRGB(100, 255, 180))
+        UpdateStatusUI(string.format("Trade Aktif: @%s", partnerName))
+
+        -- 1. JIKA MODE PENGIRIM (SENDER): OTOMATIS MASUKKAN BUAH TERPILIH
+        local itemsAddedThisSession = 0
+        if Config.AutoGift then
+            AppendLog("[AUTO INSERT] Memeriksa & memasukkan buah sesuai filter...", Color3.fromRGB(255, 230, 100))
+            UpdateStatusUI("Memasukkan buah ke offer...")
+
+            -- Minta TradingController membuka status trading
+            pcall(function()
+                if TradingController and TradingController.RequestAddItem then
+                    TradingController:RequestAddItem()
+                end
+            end)
+            task.wait(0.15)
+
+            local allFruits = ScanBackpackFruits()
+            local itemLimit = (TradeData and TradeData.ItemLimit) or 12
+            local currentOffers = (dataAsync.offers and dataAsync.offers[myIdx] and dataAsync.offers[myIdx].items) or {}
+            local currentCount = #currentOffers
+
+            for _, fruitInfo in ipairs(allFruits) do
+                if currentCount >= itemLimit then break end
+
+                if IsFruitEligible(fruitInfo) then
+                    local ok = AddFruitToTrade(fruitInfo.Tool, fruitInfo.UUID)
+                    if ok then
+                        itemsAddedThisSession = itemsAddedThisSession + 1
+                        currentCount = currentCount + 1
+                        AppendLog(string.format("[INSERT] + %s (%d/12)", fruitInfo.CleanName, currentCount), Color3.fromRGB(120, 255, 140))
+                        task.wait(Config.AddFruitDelay)
+                    end
+                end
+            end
+
+            AppendLog(string.format("[AUTO INSERT] Berhasil memasukkan %d buah (%d/12 di offer).", itemsAddedThisSession, currentCount), Color3.fromRGB(120, 255, 140))
+        end
+
+        -- 2. OTOMASI ACCEPT & CONFIRM DUA ARAH (SENDER & RECEIVER)
+        while State.IsTradeActive do
+            local currentData = nil
+            pcall(function()
+                if tradeReplicator and tradeReplicator.GetDataAsync then
+                    currentData = tradeReplicator:GetDataAsync(2)
+                elseif TradingController and TradingController.CurrentTradeReplicator then
+                    currentData = TradingController.CurrentTradeReplicator:GetDataAsync(2)
+                end
+            end)
+
+            if not currentData then break end
+
+            local sNow = workspace:GetServerTimeNow()
+            local elapsed = sNow - (currentData.lastChange or sNow)
+            local myState = currentData.states and currentData.states[myIdx] or "None"
+            local partnerState = currentData.states and currentData.states[partnerIdx] or "None"
+
+            local myOfferItems = (currentData.offers and currentData.offers[myIdx] and currentData.offers[myIdx].items) or {}
+            local partnerOfferItems = (currentData.offers and currentData.offers[partnerIdx] and currentData.offers[partnerIdx].items) or {}
+
+            -- Evaluasi Kesiapan Accept:
+            -- A. Pengirim (Sender): Siap jika offer terisi (12 penuh atau stok buah cocok habis)
+            local isSenderReady = Config.AutoGift and (#myOfferItems >= 12 or itemsAddedThisSession > 0 or #myOfferItems > 0)
+
+            -- B. Penerima (Receiver): Siap jika checkbox Auto Acc Trade aktif dan partner sudah offer / accept
+            local isReceiverReady = Config.AutoAccTrade and (#partnerOfferItems > 0 or partnerState == "Accepted" or partnerState == "Confirmed")
+
+            local shouldAccept = isSenderReady or isReceiverReady
+            local waitRemain = math.max(0, Config.ButtonCooldownWait - elapsed)
+
+            if myState == "None" then
+                if shouldAccept then
+                    if waitRemain > 0 then
+                        UpdateStatusUI(string.format("Cooldown Accept (%.1fs)...", waitRemain))
+                        task.wait(math.min(0.3, waitRemain))
+                    else
+                        AppendLog("[ACCEPT] Mengirim persetujuan trade...", Color3.fromRGB(130, 220, 255))
+                        UpdateStatusUI("Mengirim Accept...")
+                        pcall(function()
+                            if TradingController and TradingController.Accept then
+                                TradingController:Accept()
+                            elseif AcceptRemote then
+                                AcceptRemote:FireServer()
+                            end
+                        end)
+                        task.wait(0.4)
+                    end
+                else
+                    task.wait(0.3)
+                end
+            elseif myState == "Accepted" then
+                if partnerState ~= "Accepted" and partnerState ~= "Confirmed" then
+                    UpdateStatusUI("Menunggu Partner Accept...")
+                    task.wait(0.3)
+                else
+                    if waitRemain > 0 then
+                        UpdateStatusUI(string.format("Cooldown Confirm (%.1fs)...", waitRemain))
+                        task.wait(math.min(0.3, waitRemain))
+                    else
+                        AppendLog("[CONFIRM] Kedua pihak Accept! Menekan Confirm...", Color3.fromRGB(100, 255, 140))
+                        UpdateStatusUI("Mengirim Confirm...")
+                        pcall(function()
+                            if TradingController and TradingController.Confirm then
+                                TradingController:Confirm()
+                            elseif ConfirmRemote then
+                                ConfirmRemote:FireServer()
+                            end
+                        end)
+                        task.wait(0.5)
+                    end
+                end
+            elseif myState == "Confirmed" then
+                AppendLog("[TRADE SUKSES] Transaksi trade berhasil diselesaikan!", Color3.fromRGB(100, 255, 160))
+                UpdateStatusUI("Trade Selesai!")
+                if itemsAddedThisSession > 0 then
+                    State.TotalGiftedCount = State.TotalGiftedCount + itemsAddedThisSession
+                end
+                break
+            end
+
+            task.wait(0.25)
+        end
+
+        State.IsWorkerRunning = false
+        UpdateStatusUI(Config.AutoGift and "Menunggu sesi berikutnya..." or "Idle")
+    end)
+end
+
+-- Pasang Listener Event Trade Game
+if TradingController and TradingController.OnTradeCreated then
+    TradingController.OnTradeCreated:Connect(function(tradeId, replicator)
+        State.IsTradeActive = true
+        State.CurrentTradeId = tradeId
+        task.spawn(function()
+            HandleActiveTradeSession(replicator or TradingController.CurrentTradeReplicator)
+        end)
+    end)
+    TradingController.OnTradeDestroyed:Connect(function()
+        State.IsTradeActive = false
+        State.CurrentTradeId = nil
+        State.PartnerPlayer = nil
+        AppendLog("[TRADE] Sesi trade ditutup.", Color3.fromRGB(200, 200, 200))
+        UpdateStatusUI("Trade Ditutup")
+        task.spawn(function()
+            ScanBackpackFruits()
+            RefreshFruitDropdownUI()
+        end)
+    end)
+end
+
+if UpdateTradeStateRemote and UpdateTradeStateRemote.OnClientEvent then
+    UpdateTradeStateRemote.OnClientEvent:Connect(function(tradeId)
+        if tradeId then
+            if not State.IsTradeActive then
+                State.IsTradeActive = true
+                State.CurrentTradeId = tradeId
+                UpdateStatusUI("Trade Terbuka")
+                task.wait(0.25)
+                if TradingController and TradingController.CurrentTradeReplicator then
+                    task.spawn(function()
+                        HandleActiveTradeSession(TradingController.CurrentTradeReplicator)
+                    end)
+                end
+            end
+        else
+            State.IsTradeActive = false
+            State.CurrentTradeId = nil
+            State.PartnerPlayer = nil
+            UpdateStatusUI("Trade Ditutup")
+            task.spawn(function()
+                ScanBackpackFruits()
+                RefreshFruitDropdownUI()
+            end)
+        end
+    end)
+end
+
+-- Listener Auto Accept Request Masuk (TAB PENERIMA)
+if SendRequestRemote and SendRequestRemote.OnClientEvent then
+    SendRequestRemote.OnClientEvent:Connect(function(requestId, senderPlayer, _timeout)
+        if not Config.AutoAccTrade or not RespondRequestRemote then return end
+
+        local allow = true
+        if Config.ReceiverOnlyFromTarget and Config.TargetPlayerName ~= "" and senderPlayer then
+            local tName = string.lower(string.gsub(Config.TargetPlayerName, "^@", ""))
+            if string.lower(senderPlayer.Name) ~= tName and string.lower(senderPlayer.DisplayName) ~= tName then
+                allow = false
+            end
+        end
+
+        if allow and senderPlayer then
+            AppendLog(string.format("[RECEIVER] Auto Accept Request dari @%s!", senderPlayer.Name), Color3.fromRGB(100, 220, 255))
+            task.wait(0.2)
+            pcall(function()
+                RespondRequestRemote:FireServer(requestId, true)
+            end)
+        end
+    end)
+end
+
+-- Kirim Trade Request ke Penerima
+local function SendTradeRequestToTarget()
+    if not Config.TargetPlayerName or Config.TargetPlayerName == "" then
+        return false, "Nama target penerima belum dipilih/diisi!"
+    end
+
+    local targetPlayer = FindPlayerByName(Config.TargetPlayerName)
+    if not targetPlayer then
+        return false, string.format("Pemain '%s' tidak ditemukan di server!", Config.TargetPlayerName)
+    end
+
+    local okHold, holdMsg = HoldTradingTicket()
+    if not okHold then
+        return false, holdMsg
+    end
+
+    if Config.AutoStandNearTarget then
+        StandNearPlayer(targetPlayer)
+    end
+
+    task.wait(0.15)
+
+    local sentOk = false
+    if TradeRequestController and TradeRequestController.SendRequest then
+        pcall(function()
+            TradeRequestController:SendRequest(targetPlayer)
+            sentOk = true
+        end)
+    end
+
+    if not sentOk and SendRequestRemote then
+        pcall(function()
+            SendRequestRemote:FireServer(targetPlayer)
+            sentOk = true
+        end)
+    end
+
+    if not sentOk then
+        return false, "Gagal mengirim request ke remote SendRequest!"
+    end
+
+    return true, string.format("Mengirim Trade Request ke @%s...", targetPlayer.Name)
+end
+
+-- Loop Utama Auto Gift (Sender Loop)
+local function StartAutoGiftLoop()
+    if State.IsLoopRunning then return end
+    State.IsLoopRunning = true
+
+    task.spawn(function()
+        AppendLog("[AUTO GIFT] Loop Auto Gift diaktifkan!", Color3.fromRGB(100, 255, 140))
+
+        while Config.AutoGift do
+            -- 1. Cek apakah ada buah yang memenuhi syarat
+            local fruits = ScanBackpackFruits()
+            local eligibleCount = 0
+            for _, f in ipairs(fruits) do
+                if IsFruitEligible(f) then
+                    eligibleCount = eligibleCount + 1
+                end
+            end
+
+            if eligibleCount == 0 then
+                AppendLog("[AUTO GIFT] Tidak ada buah di tas yang cocok dengan filter! Menunggu stok...", Color3.fromRGB(255, 180, 100))
+                UpdateStatusUI("Stok buah cocok habis")
+                task.wait(4.0)
+            else
+                -- 2. Jika sedang tidak dalam trade, kirim request
+                if not State.IsTradeActive then
+                    UpdateStatusUI("Mempersiapkan Trade...")
+                    local ok, msg = SendTradeRequestToTarget()
+                    AppendLog(string.format("[AUTO GIFT] %s (Sisa %d buah cocok)", msg, eligibleCount), ok and Color3.fromRGB(130, 220, 255) or Color3.fromRGB(255, 100, 100))
+
+                    -- Tunggu respon penerima
+                    local waitStart = tick()
+                    while not State.IsTradeActive and Config.AutoGift and (tick() - waitStart < 5.0) do
+                        task.wait(0.5)
+                    end
+                else
+                    -- Sedang dalam trade, tunggu sesi selesai
+                    while State.IsTradeActive and Config.AutoGift do
+                        task.wait(0.5)
+                    end
+                    task.wait(1.5) -- Jeda antar sesi trade
+                end
+            end
+
+            task.wait(1.5)
+        end
+
+        State.IsLoopRunning = false
+        AppendLog("[AUTO GIFT] Loop Auto Gift dihentikan.", Color3.fromRGB(255, 180, 180))
+        UpdateStatusUI("Idle")
+    end)
+end
+
+-- ========================================================================================
+-- 8. PEMBUATAN USER INTERFACE (HUKI MODERN CLEAN THEME)
+-- ========================================================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "HUKI_FruitGifter_Gui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = GetSafeGuiParent()
+
+if getgenv then
+    getgenv().HUKI_FruitGifter_Gui = ScreenGui
+end
+
+-- Helper Dragging Frame
+local function MakeDraggable(dragPart, mainFrame)
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+
+    dragPart.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = mainFrame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    dragPart.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- Floating Minimize / Open Button
+local OpenPill = Instance.new("TextButton")
+OpenPill.Name = "HUKI_OpenPill"
+OpenPill.Size = UDim2.new(0, 150, 0, 36)
+OpenPill.Position = UDim2.new(0.02, 0, 0.45, 0)
+OpenPill.BackgroundColor3 = Color3.fromRGB(20, 24, 34)
+OpenPill.Text = "  HUKI FRUIT GIFTER"
+OpenPill.TextColor3 = Color3.fromRGB(0, 220, 255)
+OpenPill.Font = Enum.Font.GothamBold
+OpenPill.TextSize = 11
+OpenPill.TextXAlignment = Enum.TextXAlignment.Center
+OpenPill.Visible = false
+OpenPill.Parent = ScreenGui
+
+local OpenPillCorner = Instance.new("UICorner", OpenPill)
+OpenPillCorner.CornerRadius = UDim.new(0, 18)
+local OpenPillStroke = Instance.new("UIStroke", OpenPill)
+OpenPillStroke.Color = Color3.fromRGB(0, 180, 216)
+OpenPillStroke.Thickness = 1.5
+
+-- Main Container Window
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 440, 0, 520)
+MainFrame.Position = UDim2.new(0.5, -220, 0.5, -260)
+MainFrame.BackgroundColor3 = Color3.fromRGB(16, 18, 26)
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner", MainFrame)
+MainCorner.CornerRadius = UDim.new(0, 12)
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Color = Color3.fromRGB(45, 52, 72)
+MainStroke.Thickness = 1.2
+
+-- Title Bar
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 42)
+TitleBar.BackgroundColor3 = Color3.fromRGB(22, 26, 38)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
+
+local TitleBarCorner = Instance.new("UICorner", TitleBar)
+TitleBarCorner.CornerRadius = UDim.new(0, 12)
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Name = "TitleLabel"
+TitleLabel.Size = UDim2.new(1, -90, 1, 0)
+TitleLabel.Position = UDim2.new(0, 14, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "HUKI - FRUIT TRADE GIFTER"
+TitleLabel.TextColor3 = Color3.fromRGB(0, 210, 255)
+TitleLabel.Font = Enum.Font.GothamBlack
+TitleLabel.TextSize = 13
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+-- Minimize Button
+local MinBtn = Instance.new("TextButton")
+MinBtn.Name = "MinBtn"
+MinBtn.Size = UDim2.new(0, 28, 0, 28)
+MinBtn.Position = UDim2.new(1, -66, 0, 7)
+MinBtn.BackgroundColor3 = Color3.fromRGB(32, 38, 54)
+MinBtn.Text = "-"
+MinBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextSize = 15
+MinBtn.Parent = TitleBar
+local MinCorner = Instance.new("UICorner", MinBtn)
+MinCorner.CornerRadius = UDim.new(0, 6)
+
+-- Close Button
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Name = "CloseBtn"
+CloseBtn.Size = UDim2.new(0, 28, 0, 28)
+CloseBtn.Position = UDim2.new(1, -34, 0, 7)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(60, 25, 30)
+CloseBtn.Text = "X"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 120, 120)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 12
+CloseBtn.Parent = TitleBar
+local CloseCorner = Instance.new("UICorner", CloseBtn)
+CloseCorner.CornerRadius = UDim.new(0, 6)
+
+MakeDraggable(TitleBar, MainFrame)
+MakeDraggable(OpenPill, OpenPill)
+
+MinBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+    OpenPill.Visible = true
+end)
+
+OpenPill.MouseButton1Click:Connect(function()
+    MainFrame.Visible = true
+    OpenPill.Visible = false
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    ScreenGui:Destroy()
+    if getgenv then getgenv().HUKI_FruitGifter_Gui = nil end
+end)
+
+-- Tab Switcher Bar
+local TabBar = Instance.new("Frame")
+TabBar.Name = "TabBar"
+TabBar.Size = UDim2.new(1, -24, 0, 36)
+TabBar.Position = UDim2.new(0, 12, 0, 48)
+TabBar.BackgroundColor3 = Color3.fromRGB(24, 28, 42)
+TabBar.BorderSizePixel = 0
+TabBar.Parent = MainFrame
+local TabBarCorner = Instance.new("UICorner", TabBar)
+TabBarCorner.CornerRadius = UDim.new(0, 8)
+
+local TabSenderBtn = Instance.new("TextButton")
+TabSenderBtn.Name = "TabSenderBtn"
+TabSenderBtn.Size = UDim2.new(0.5, -3, 1, -6)
+TabSenderBtn.Position = UDim2.new(0, 3, 0, 3)
+TabSenderBtn.BackgroundColor3 = Color3.fromRGB(0, 180, 216)
+TabSenderBtn.Text = "TAB PENGIRIM"
+TabSenderBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+TabSenderBtn.Font = Enum.Font.GothamBold
+TabSenderBtn.TextSize = 12
+TabSenderBtn.Parent = TabBar
+local TabSenderCorner = Instance.new("UICorner", TabSenderBtn)
+TabSenderCorner.CornerRadius = UDim.new(0, 6)
+
+local TabReceiverBtn = Instance.new("TextButton")
+TabReceiverBtn.Name = "TabReceiverBtn"
+TabReceiverBtn.Size = UDim2.new(0.5, -3, 1, -6)
+TabReceiverBtn.Position = UDim2.new(0.5, 0, 0, 3)
+TabReceiverBtn.BackgroundColor3 = Color3.fromRGB(28, 32, 48)
+TabReceiverBtn.Text = "TAB PENERIMA"
+TabReceiverBtn.TextColor3 = Color3.fromRGB(150, 160, 180)
+TabReceiverBtn.Font = Enum.Font.GothamBold
+TabReceiverBtn.TextSize = 12
+TabReceiverBtn.Parent = TabBar
+local TabReceiverCorner = Instance.new("UICorner", TabReceiverBtn)
+TabReceiverCorner.CornerRadius = UDim.new(0, 6)
+
+-- Containers for Tabs
+local ContentContainer = Instance.new("Frame")
+ContentContainer.Name = "ContentContainer"
+ContentContainer.Size = UDim2.new(1, -24, 1, -190)
+ContentContainer.Position = UDim2.new(0, 12, 0, 90)
+ContentContainer.BackgroundTransparency = 1
+ContentContainer.Parent = MainFrame
+
+-- Tab 1: Pengirim Frame
+local SenderScroll = Instance.new("ScrollingFrame")
+SenderScroll.Name = "SenderScroll"
+SenderScroll.Size = UDim2.new(1, 0, 1, 0)
+SenderScroll.BackgroundTransparency = 1
+SenderScroll.BorderSizePixel = 0
+SenderScroll.ScrollBarThickness = 4
+SenderScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 180, 216)
+SenderScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+SenderScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+SenderScroll.Visible = true
+SenderScroll.Parent = ContentContainer
+
+local SenderLayout = Instance.new("UIListLayout", SenderScroll)
+SenderLayout.SortOrder = Enum.SortOrder.LayoutOrder
+SenderLayout.Padding = UDim.new(0, 8)
+
+-- Tab 2: Penerima Frame
+local ReceiverFrame = Instance.new("Frame")
+ReceiverFrame.Name = "ReceiverFrame"
+ReceiverFrame.Size = UDim2.new(1, 0, 1, 0)
+ReceiverFrame.BackgroundTransparency = 1
+ReceiverFrame.Visible = false
+ReceiverFrame.Parent = ContentContainer
+
+local ReceiverLayout = Instance.new("UIListLayout", ReceiverFrame)
+ReceiverLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ReceiverLayout.Padding = UDim.new(0, 12)
+
+-- Status & Mini Console Bar at Bottom of Main Frame
+local BottomBar = Instance.new("Frame")
+BottomBar.Name = "BottomBar"
+BottomBar.Size = UDim2.new(1, -24, 0, 88)
+BottomBar.Position = UDim2.new(0, 12, 1, -96)
+BottomBar.BackgroundColor3 = Color3.fromRGB(20, 24, 34)
+BottomBar.BorderSizePixel = 0
+BottomBar.Parent = MainFrame
+local BottomCorner = Instance.new("UICorner", BottomBar)
+BottomCorner.CornerRadius = UDim.new(0, 8)
+
+local StatusLine = Instance.new("TextLabel")
+StatusLine.Name = "StatusLine"
+StatusLine.Size = UDim2.new(1, -16, 0, 20)
+StatusLine.Position = UDim2.new(0, 8, 0, 4)
+StatusLine.BackgroundTransparency = 1
+StatusLine.Text = "Status: Idle | Buah Terkirim: 0"
+StatusLine.TextColor3 = Color3.fromRGB(0, 220, 255)
+StatusLine.Font = Enum.Font.GothamBold
+StatusLine.TextSize = 11
+StatusLine.TextXAlignment = Enum.TextXAlignment.Left
+StatusLine.Parent = BottomBar
+
+local LogLabel = Instance.new("TextLabel")
+LogLabel.Name = "LogLabel"
+LogLabel.Size = UDim2.new(1, -16, 0, 56)
+LogLabel.Position = UDim2.new(0, 8, 0, 26)
+LogLabel.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+LogLabel.TextColor3 = Color3.fromRGB(180, 240, 200)
+LogLabel.Font = Enum.Font.Code
+LogLabel.TextSize = 10
+LogLabel.TextWrapped = true
+LogLabel.TextXAlignment = Enum.TextXAlignment.Left
+LogLabel.TextYAlignment = Enum.TextYAlignment.Top
+LogLabel.Text = "[HUKI] Script siap digunakan. Pilih tab di atas."
+LogLabel.Parent = BottomBar
+local LogCorner = Instance.new("UICorner", LogLabel)
+LogCorner.CornerRadius = UDim.new(0, 6)
+
+-- Logging & Status functions dibungkus pcall sepenuhnya
+AppendLog = function(msg, color)
+    pcall(function()
+        print("[HUKI Fruit Gifter] " .. tostring(msg))
+    end)
+    pcall(function()
+        if LogLabel and LogLabel.Parent then
+            LogLabel.Text = tostring(msg)
+            if color then
+                LogLabel.TextColor3 = color
+            end
+        end
+    end)
+end
+
+UpdateStatusUI = function(customStatus)
+    pcall(function()
+        if StatusLine and StatusLine.Parent then
+            local s = customStatus or (Config.AutoGift and "Auto Gift Aktif" or "Idle")
+            StatusLine.Text = string.format("Status: %s | Buah Terkirim: %d", s, State.TotalGiftedCount)
+        end
+    end)
+end
+
+-- Tab Switch Handler
+local function SwitchTab(tabName)
+    State.ActiveTab = tabName
+    if tabName == "Pengirim" then
+        TabSenderBtn.BackgroundColor3 = Color3.fromRGB(0, 180, 216)
+        TabSenderBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TabReceiverBtn.BackgroundColor3 = Color3.fromRGB(28, 32, 48)
+        TabReceiverBtn.TextColor3 = Color3.fromRGB(150, 160, 180)
+        SenderScroll.Visible = true
+        ReceiverFrame.Visible = false
+    else
+        TabReceiverBtn.BackgroundColor3 = Color3.fromRGB(0, 180, 216)
+        TabReceiverBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        TabSenderBtn.BackgroundColor3 = Color3.fromRGB(28, 32, 48)
+        TabSenderBtn.TextColor3 = Color3.fromRGB(150, 160, 180)
+        SenderScroll.Visible = false
+        ReceiverFrame.Visible = true
+    end
+end
+
+TabSenderBtn.MouseButton1Click:Connect(function() SwitchTab("Pengirim") end)
+TabReceiverBtn.MouseButton1Click:Connect(function() SwitchTab("Penerima") end)
+
+-- ========================================================================================
+-- 9. ELEMEN TAB PENGIRIM (SENDER)
+-- ========================================================================================
+
+local function CreateSectionCard(parent, titleText, layoutOrder)
+    local card = Instance.new("Frame")
+    card.Name = "Card_" .. titleText
+    card.Size = UDim2.new(1, 0, 0, 0)
+    card.AutomaticSize = Enum.AutomaticSize.Y
+    card.BackgroundColor3 = Color3.fromRGB(22, 26, 38)
+    card.BorderSizePixel = 0
+    card.LayoutOrder = layoutOrder or 1
+    card.Parent = parent
+
+    local cardCorner = Instance.new("UICorner", card)
+    cardCorner.CornerRadius = UDim.new(0, 8)
+    local cardStroke = Instance.new("UIStroke", card)
+    cardStroke.Color = Color3.fromRGB(36, 42, 60)
+    cardStroke.Thickness = 1
+
+    local pad = Instance.new("UIPadding", card)
+    pad.PaddingTop = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingLeft = UDim.new(0, 10)
+    pad.PaddingRight = UDim.new(0, 10)
+
+    local list = Instance.new("UIListLayout", card)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, 6)
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, 0, 0, 18)
+    title.BackgroundTransparency = 1
+    title.Text = titleText
+    title.TextColor3 = Color3.fromRGB(120, 215, 255)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.LayoutOrder = 1
+    title.Parent = card
+
+    return card
+end
+
+-------------------------------------------------------------------------------------------
+-- 1. SECTION: PEMILIHAN BUAH (DROPDOWN CHECKBOX)
+-------------------------------------------------------------------------------------------
+local FruitCard = CreateSectionCard(SenderScroll, "1. PEMILIHAN BUAH (DROPDOWN CHECKBOX)", 1)
+
+local FruitDropdownTrigger = Instance.new("TextButton")
+FruitDropdownTrigger.Name = "FruitDropdownTrigger"
+FruitDropdownTrigger.Size = UDim2.new(1, 0, 0, 32)
+FruitDropdownTrigger.BackgroundColor3 = Color3.fromRGB(28, 34, 50)
+FruitDropdownTrigger.Text = "  Pilih Jenis Buah: [Semua Buah Aktif]  [v]"
+FruitDropdownTrigger.TextColor3 = Color3.fromRGB(255, 255, 255)
+FruitDropdownTrigger.Font = Enum.Font.GothamSemibold
+FruitDropdownTrigger.TextSize = 11
+FruitDropdownTrigger.TextXAlignment = Enum.TextXAlignment.Left
+FruitDropdownTrigger.LayoutOrder = 2
+FruitDropdownTrigger.Parent = FruitCard
+local FDTCorner = Instance.new("UICorner", FruitDropdownTrigger)
+FDTCorner.CornerRadius = UDim.new(0, 6)
+
+local FruitDropdownContainer = Instance.new("Frame")
+FruitDropdownContainer.Name = "FruitDropdownContainer"
+FruitDropdownContainer.Size = UDim2.new(1, 0, 0, 0)
+FruitDropdownContainer.AutomaticSize = Enum.AutomaticSize.Y
+FruitDropdownContainer.BackgroundColor3 = Color3.fromRGB(18, 22, 32)
+FruitDropdownContainer.Visible = false
+FruitDropdownContainer.LayoutOrder = 3
+FruitDropdownContainer.Parent = FruitCard
+local FDC_Corner = Instance.new("UICorner", FruitDropdownContainer)
+FDC_Corner.CornerRadius = UDim.new(0, 6)
+local FDC_Pad = Instance.new("UIPadding", FruitDropdownContainer)
+FDC_Pad.PaddingTop = UDim.new(0, 6)
+FDC_Pad.PaddingBottom = UDim.new(0, 6)
+FDC_Pad.PaddingLeft = UDim.new(0, 6)
+FDC_Pad.PaddingRight = UDim.new(0, 6)
+local FDC_Layout = Instance.new("UIListLayout", FruitDropdownContainer)
+FDC_Layout.SortOrder = Enum.SortOrder.LayoutOrder
+FDC_Layout.Padding = UDim.new(0, 4)
+
+local FruitActionBar = Instance.new("Frame")
+FruitActionBar.Name = "FruitActionBar"
+FruitActionBar.Size = UDim2.new(1, 0, 0, 26)
+FruitActionBar.BackgroundTransparency = 1
+FruitActionBar.LayoutOrder = 1
+FruitActionBar.Parent = FruitDropdownContainer
+local FAB_Layout = Instance.new("UIListLayout", FruitActionBar)
+FAB_Layout.FillDirection = Enum.FillDirection.Horizontal
+FAB_Layout.Padding = UDim.new(0, 6)
+
+local BtnSelectAllFruits = Instance.new("TextButton")
+BtnSelectAllFruits.Name = "BtnSelectAllFruits"
+BtnSelectAllFruits.Size = UDim2.new(0.32, -4, 1, 0)
+BtnSelectAllFruits.BackgroundColor3 = Color3.fromRGB(0, 150, 180)
+BtnSelectAllFruits.Text = "Pilih Semua"
+BtnSelectAllFruits.TextColor3 = Color3.fromRGB(255, 255, 255)
+BtnSelectAllFruits.Font = Enum.Font.GothamBold
+BtnSelectAllFruits.TextSize = 10
+BtnSelectAllFruits.Parent = FruitActionBar
+local BSA_Corner = Instance.new("UICorner", BtnSelectAllFruits)
+BSA_Corner.CornerRadius = UDim.new(0, 4)
+
+local BtnDeselectAllFruits = Instance.new("TextButton")
+BtnDeselectAllFruits.Name = "BtnDeselectAllFruits"
+BtnDeselectAllFruits.Size = UDim2.new(0.32, -4, 1, 0)
+BtnDeselectAllFruits.BackgroundColor3 = Color3.fromRGB(60, 40, 50)
+BtnDeselectAllFruits.Text = "Hapus Semua"
+BtnDeselectAllFruits.TextColor3 = Color3.fromRGB(240, 180, 180)
+BtnDeselectAllFruits.Font = Enum.Font.GothamBold
+BtnDeselectAllFruits.TextSize = 10
+BtnDeselectAllFruits.Parent = FruitActionBar
+local BDA_Corner = Instance.new("UICorner", BtnDeselectAllFruits)
+BDA_Corner.CornerRadius = UDim.new(0, 4)
+
+local BtnScanFruits = Instance.new("TextButton")
+BtnScanFruits.Name = "BtnScanFruits"
+BtnScanFruits.Size = UDim2.new(0.34, -4, 1, 0)
+BtnScanFruits.BackgroundColor3 = Color3.fromRGB(36, 45, 65)
+BtnScanFruits.Text = "Scan Tas"
+BtnScanFruits.TextColor3 = Color3.fromRGB(180, 220, 255)
+BtnScanFruits.Font = Enum.Font.GothamBold
+BtnScanFruits.TextSize = 10
+BtnScanFruits.Parent = FruitActionBar
+local BSF_Corner = Instance.new("UICorner", BtnScanFruits)
+BSF_Corner.CornerRadius = UDim.new(0, 4)
+
+local FruitListScroll = Instance.new("ScrollingFrame")
+FruitListScroll.Name = "FruitListScroll"
+FruitListScroll.Size = UDim2.new(1, 0, 0, 140)
+FruitListScroll.BackgroundTransparency = 1
+FruitListScroll.BorderSizePixel = 0
+FruitListScroll.ScrollBarThickness = 3
+FruitListScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+FruitListScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+FruitListScroll.LayoutOrder = 2
+FruitListScroll.Parent = FruitDropdownContainer
+
+local FLS_Layout = Instance.new("UIListLayout", FruitListScroll)
+FLS_Layout.SortOrder = Enum.SortOrder.LayoutOrder
+FLS_Layout.Padding = UDim.new(0, 3)
+
+local function UpdateFruitTriggerSummary()
+    local arrow = (FruitDropdownContainer and FruitDropdownContainer.Visible) and "[^]" or "[v]"
+    if #State.DiscoveredFruits == 0 then
+        FruitDropdownTrigger.Text = string.format("  Pilih Jenis Buah: [Tas Kosong / 0 Buah]  %s", arrow)
+    elseif Config.SelectAllFruits then
+        local totalFruits = 0
+        for _, cnt in pairs(State.BagFruitCounts) do
+            totalFruits = totalFruits + cnt
+        end
+        FruitDropdownTrigger.Text = string.format("  Pilih Jenis Buah: [Semua di Tas (%d jenis - %d buah)]  %s", #State.DiscoveredFruits, totalFruits, arrow)
+    else
+        local count = 0
+        local names = {}
+        for fName, sel in pairs(Config.SelectedFruits) do
+            if sel and (State.BagFruitCounts[fName] or 0) > 0 then
+                count = count + 1
+                table.insert(names, fName)
+            end
+        end
+        if count == 0 then
+            FruitDropdownTrigger.Text = string.format("  Pilih Jenis Buah: [Tidak Ada Terpilih]  %s", arrow)
+        elseif count == 1 then
+            local qty = State.BagFruitCounts[names[1]] or 0
+            FruitDropdownTrigger.Text = string.format("  Pilih Jenis Buah: [%s (%d buah)]  %s", names[1], qty, arrow)
+        else
+            FruitDropdownTrigger.Text = string.format("  Pilih Jenis Buah: [%d Jenis Terpilih]  %s", count, arrow)
+        end
+    end
+end
+
+RefreshFruitDropdownUI = function()
+    for _, child in ipairs(FruitListScroll:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    local fruits = State.DiscoveredFruits
+    if #fruits == 0 then
+        ScanBackpackFruits()
+        fruits = State.DiscoveredFruits
+    end
+
+    if #fruits == 0 then
+        local emptyRow = Instance.new("Frame")
+        emptyRow.Name = "EmptyRow"
+        emptyRow.Size = UDim2.new(1, -6, 0, 36)
+        emptyRow.BackgroundColor3 = Color3.fromRGB(22, 26, 36)
+        emptyRow.Parent = FruitListScroll
+        local c = Instance.new("UICorner", emptyRow)
+        c.CornerRadius = UDim.new(0, 4)
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -12, 1, 0)
+        lbl.Position = UDim2.new(0, 6, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = "Tidak ada buah di tas! Panen buah lalu klik [Scan Tas]."
+        lbl.TextColor3 = Color3.fromRGB(240, 170, 100)
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 10
+        lbl.TextWrapped = true
+        lbl.TextXAlignment = Enum.TextXAlignment.Center
+        lbl.Parent = emptyRow
+    else
+        for idx, fruitName in ipairs(fruits) do
+            local stock = State.BagFruitCounts[fruitName] or 0
+            local isChecked = Config.SelectAllFruits or (Config.SelectedFruits[fruitName] == true)
+
+            local row = Instance.new("Frame")
+            row.Name = "FruitRow_" .. fruitName
+            row.Size = UDim2.new(1, -6, 0, 26)
+            row.BackgroundColor3 = isChecked and Color3.fromRGB(24, 40, 54) or Color3.fromRGB(22, 26, 36)
+            row.LayoutOrder = idx
+            row.Parent = FruitListScroll
+            local rowCorner = Instance.new("UICorner", row)
+            rowCorner.CornerRadius = UDim.new(0, 4)
+
+            local box = Instance.new("TextButton")
+            box.Name = "Box"
+            box.Size = UDim2.new(0, 18, 0, 18)
+            box.Position = UDim2.new(0, 4, 0, 4)
+            box.BackgroundColor3 = isChecked and Color3.fromRGB(0, 180, 216) or Color3.fromRGB(36, 42, 58)
+            box.Text = isChecked and "X" or ""
+            box.TextColor3 = Color3.fromRGB(255, 255, 255)
+            box.Font = Enum.Font.GothamBold
+            box.TextSize = 10
+            box.Parent = row
+            local boxCorner = Instance.new("UICorner", box)
+            boxCorner.CornerRadius = UDim.new(0, 3)
+
+            local label = Instance.new("TextButton")
+            label.Name = "Label"
+            label.Size = UDim2.new(1, -28, 1, 0)
+            label.Position = UDim2.new(0, 26, 0, 0)
+            label.BackgroundTransparency = 1
+            label.Text = string.format("%s (Stok: %d)", fruitName, stock)
+            label.TextColor3 = isChecked and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 190)
+            label.Font = Enum.Font.Gotham
+            label.TextSize = 11
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.Parent = row
+
+            local function ToggleRow()
+                Config.SelectAllFruits = false
+                Config.SelectedFruits[fruitName] = not Config.SelectedFruits[fruitName]
+                local checked = Config.SelectedFruits[fruitName] == true
+                box.Text = checked and "X" or ""
+                box.BackgroundColor3 = checked and Color3.fromRGB(0, 180, 216) or Color3.fromRGB(36, 42, 58)
+                row.BackgroundColor3 = checked and Color3.fromRGB(24, 40, 54) or Color3.fromRGB(22, 26, 36)
+                label.TextColor3 = checked and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 190)
+                UpdateFruitTriggerSummary()
+            end
+
+            box.MouseButton1Click:Connect(ToggleRow)
+            label.MouseButton1Click:Connect(ToggleRow)
+        end
+    end
+
+    UpdateFruitTriggerSummary()
+end
+
+FruitDropdownTrigger.MouseButton1Click:Connect(function()
+    FruitDropdownContainer.Visible = not FruitDropdownContainer.Visible
+    if FruitDropdownContainer.Visible then
+        ScanBackpackFruits()
+        RefreshFruitDropdownUI()
+    end
+    UpdateFruitTriggerSummary()
+end)
+
+BtnSelectAllFruits.MouseButton1Click:Connect(function()
+    Config.SelectAllFruits = true
+    Config.SelectedFruits = {}
+    RefreshFruitDropdownUI()
+end)
+
+BtnDeselectAllFruits.MouseButton1Click:Connect(function()
+    Config.SelectAllFruits = false
+    Config.SelectedFruits = {}
+    RefreshFruitDropdownUI()
+end)
+
+BtnScanFruits.MouseButton1Click:Connect(function()
+    local all = ScanBackpackFruits()
+    RefreshFruitDropdownUI()
+    AppendLog(string.format("[SCAN] Tas dipindai: Ditemukan %d jenis buah (%d total item).", #State.DiscoveredFruits, #all), Color3.fromRGB(120, 255, 180))
+end)
+
+-------------------------------------------------------------------------------------------
+-- 2. SECTION: FILTER MUTASI BUAH (DROPDOWN CHECKBOX)
+-------------------------------------------------------------------------------------------
+local MutationCard = CreateSectionCard(SenderScroll, "2. FILTER MUTASI BUAH", 2)
+
+local MutationDropdownTrigger = Instance.new("TextButton")
+MutationDropdownTrigger.Name = "MutationDropdownTrigger"
+MutationDropdownTrigger.Size = UDim2.new(1, 0, 0, 32)
+MutationDropdownTrigger.BackgroundColor3 = Color3.fromRGB(28, 34, 50)
+MutationDropdownTrigger.Text = "  Filter Mutasi: [Semua Mutasi Diizinkan]  [v]"
+MutationDropdownTrigger.TextColor3 = Color3.fromRGB(255, 255, 255)
+MutationDropdownTrigger.Font = Enum.Font.GothamSemibold
+MutationDropdownTrigger.TextSize = 11
+MutationDropdownTrigger.TextXAlignment = Enum.TextXAlignment.Left
+MutationDropdownTrigger.LayoutOrder = 2
+MutationDropdownTrigger.Parent = MutationCard
+local MDTCorner = Instance.new("UICorner", MutationDropdownTrigger)
+MDTCorner.CornerRadius = UDim.new(0, 6)
+
+local MutationDropdownContainer = Instance.new("Frame")
+MutationDropdownContainer.Name = "MutationDropdownContainer"
+MutationDropdownContainer.Size = UDim2.new(1, 0, 0, 0)
+MutationDropdownContainer.AutomaticSize = Enum.AutomaticSize.Y
+MutationDropdownContainer.BackgroundColor3 = Color3.fromRGB(18, 22, 32)
+MutationDropdownContainer.Visible = false
+MutationDropdownContainer.LayoutOrder = 3
+MutationDropdownContainer.Parent = MutationCard
+local MDC_Corner = Instance.new("UICorner", MutationDropdownContainer)
+MDC_Corner.CornerRadius = UDim.new(0, 6)
+local MDC_Pad = Instance.new("UIPadding", MutationDropdownContainer)
+MDC_Pad.PaddingTop = UDim.new(0, 6)
+MDC_Pad.PaddingBottom = UDim.new(0, 6)
+MDC_Pad.PaddingLeft = UDim.new(0, 6)
+MDC_Pad.PaddingRight = UDim.new(0, 6)
+local MDC_Layout = Instance.new("UIListLayout", MutationDropdownContainer)
+MDC_Layout.SortOrder = Enum.SortOrder.LayoutOrder
+MDC_Layout.Padding = UDim.new(0, 4)
+
+local MutActionBar = Instance.new("Frame")
+MutActionBar.Name = "MutActionBar"
+MutActionBar.Size = UDim2.new(1, 0, 0, 26)
+MutActionBar.BackgroundTransparency = 1
+MutActionBar.LayoutOrder = 1
+MutActionBar.Parent = MutationDropdownContainer
+local MAB_Layout = Instance.new("UIListLayout", MutActionBar)
+MAB_Layout.FillDirection = Enum.FillDirection.Horizontal
+MAB_Layout.Padding = UDim.new(0, 4)
+
+local function CreateMutPresetBtn(name, text, widthScale)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.Size = UDim2.new(widthScale, -3, 1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(36, 45, 65)
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(200, 230, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.Parent = MutActionBar
+    local c = Instance.new("UICorner", btn)
+    c.CornerRadius = UDim.new(0, 4)
+    return btn
+end
+
+local BtnMutAll = CreateMutPresetBtn("BtnMutAll", "Semua", 0.25)
+local BtnMutNormal = CreateMutPresetBtn("BtnMutNormal", "Hanya Normal", 0.35)
+local BtnMutHiero = CreateMutPresetBtn("BtnMutHiero", "Hanya Hiero", 0.38)
+
+local MutationListScroll = Instance.new("ScrollingFrame")
+MutationListScroll.Name = "MutationListScroll"
+MutationListScroll.Size = UDim2.new(1, 0, 0, 130)
+MutationListScroll.BackgroundTransparency = 1
+MutationListScroll.BorderSizePixel = 0
+MutationListScroll.ScrollBarThickness = 3
+MutationListScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+MutationListScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+MutationListScroll.LayoutOrder = 2
+MutationListScroll.Parent = MutationDropdownContainer
+
+local MLS_Layout = Instance.new("UIListLayout", MutationListScroll)
+MLS_Layout.SortOrder = Enum.SortOrder.LayoutOrder
+MLS_Layout.Padding = UDim.new(0, 3)
+
+local function UpdateMutationTriggerSummary()
+    local arrow = (MutationDropdownContainer and MutationDropdownContainer.Visible) and "[^]" or "[v]"
+    if Config.SelectedMutations["All"] == true then
+        MutationDropdownTrigger.Text = string.format("  Filter Mutasi: [Semua Mutasi Diizinkan]  %s", arrow)
+    else
+        local count = 0
+        local names = {}
+        for m, sel in pairs(Config.SelectedMutations) do
+            if sel and m ~= "All" then
+                count = count + 1
+                table.insert(names, m)
+            end
+        end
+        if count == 0 then
+            MutationDropdownTrigger.Text = string.format("  Filter Mutasi: [Tidak Ada Mutasi Terpilih]  %s", arrow)
+        elseif count <= 2 then
+            MutationDropdownTrigger.Text = string.format("  Filter Mutasi: [%s]  %s", table.concat(names, ", "), arrow)
+        else
+            MutationDropdownTrigger.Text = string.format("  Filter Mutasi: [%d Mutasi Aktif]  %s", count, arrow)
+        end
+    end
+end
+
+RefreshMutationDropdownUI = function()
+    for _, child in ipairs(MutationListScroll:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    local displayList = { "Semua Mutasi (All)", "Normal (Tanpa Mutasi)" }
+    for _, km in ipairs(KNOWN_MUTATIONS) do
+        table.insert(displayList, km)
+    end
+
+    for idx, rawName in ipairs(displayList) do
+        local key = (rawName == "Semua Mutasi (All)") and "All"
+            or (rawName == "Normal (Tanpa Mutasi)") and "Normal"
+            or rawName
+
+        local isChecked = Config.SelectedMutations[key] == true
+        if Config.SelectedMutations["All"] == true and key ~= "All" then
+            isChecked = true
+        end
+
+        local row = Instance.new("Frame")
+        row.Name = "MutRow_" .. key
+        row.Size = UDim2.new(1, -6, 0, 24)
+        row.BackgroundColor3 = isChecked and Color3.fromRGB(24, 40, 54) or Color3.fromRGB(22, 26, 36)
+        row.LayoutOrder = idx
+        row.Parent = MutationListScroll
+        local rowCorner = Instance.new("UICorner", row)
+        rowCorner.CornerRadius = UDim.new(0, 4)
+
+        local box = Instance.new("TextButton")
+        box.Name = "Box"
+        box.Size = UDim2.new(0, 16, 0, 16)
+        box.Position = UDim2.new(0, 4, 0, 4)
+        box.BackgroundColor3 = isChecked and Color3.fromRGB(0, 180, 216) or Color3.fromRGB(36, 42, 58)
+        box.Text = isChecked and "X" or ""
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.Font = Enum.Font.GothamBold
+        box.TextSize = 9
+        box.Parent = row
+        local boxCorner = Instance.new("UICorner", box)
+        boxCorner.CornerRadius = UDim.new(0, 3)
+
+        local label = Instance.new("TextButton")
+        label.Name = "Label"
+        label.Size = UDim2.new(1, -26, 1, 0)
+        label.Position = UDim2.new(0, 24, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = rawName
+        label.TextColor3 = isChecked and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 190)
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 10
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = row
+
+        local function ToggleMut()
+            if key == "All" then
+                local nextState = not (Config.SelectedMutations["All"] == true)
+                Config.SelectedMutations = { ["All"] = nextState }
+            else
+                Config.SelectedMutations["All"] = false
+                Config.SelectedMutations[key] = not Config.SelectedMutations[key]
+            end
+            RefreshMutationDropdownUI()
+        end
+
+        box.MouseButton1Click:Connect(ToggleMut)
+        label.MouseButton1Click:Connect(ToggleMut)
+    end
+
+    UpdateMutationTriggerSummary()
+end
+
+MutationDropdownTrigger.MouseButton1Click:Connect(function()
+    MutationDropdownContainer.Visible = not MutationDropdownContainer.Visible
+    if MutationDropdownContainer.Visible then
+        RefreshMutationDropdownUI()
+    end
+    UpdateMutationTriggerSummary()
+end)
+
+BtnMutAll.MouseButton1Click:Connect(function()
+    Config.SelectedMutations = { ["All"] = true }
+    RefreshMutationDropdownUI()
+end)
+
+BtnMutNormal.MouseButton1Click:Connect(function()
+    Config.SelectedMutations = { ["Normal"] = true }
+    RefreshMutationDropdownUI()
+end)
+
+BtnMutHiero.MouseButton1Click:Connect(function()
+    Config.SelectedMutations = { ["Hieroglyphic"] = true }
+    RefreshMutationDropdownUI()
+end)
+
+-------------------------------------------------------------------------------------------
+-- 3. SECTION: PILIH PENERIMA (RECIPIENT SELECTION)
+-------------------------------------------------------------------------------------------
+local RecipientCard = CreateSectionCard(SenderScroll, "3. PILIH PENERIMA", 3)
+
+local RecipientInputRow = Instance.new("Frame")
+RecipientInputRow.Name = "RecipientInputRow"
+RecipientInputRow.Size = UDim2.new(1, 0, 0, 32)
+RecipientInputRow.BackgroundTransparency = 1
+RecipientInputRow.LayoutOrder = 2
+RecipientInputRow.Parent = RecipientCard
+local RIR_Layout = Instance.new("UIListLayout", RecipientInputRow)
+RIR_Layout.FillDirection = Enum.FillDirection.Horizontal
+RIR_Layout.Padding = UDim.new(0, 6)
+
+local RecipientTextBox = Instance.new("TextBox")
+RecipientTextBox.Name = "RecipientTextBox"
+RecipientTextBox.Size = UDim2.new(0.72, -4, 1, 0)
+RecipientTextBox.BackgroundColor3 = Color3.fromRGB(28, 34, 50)
+RecipientTextBox.PlaceholderText = "Ketik / Pilih nama @Username..."
+RecipientTextBox.PlaceholderColor3 = Color3.fromRGB(120, 130, 150)
+RecipientTextBox.Text = Config.TargetPlayerName
+RecipientTextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+RecipientTextBox.Font = Enum.Font.Gotham
+RecipientTextBox.TextSize = 11
+RecipientTextBox.ClearTextOnFocus = false
+RecipientTextBox.Parent = RecipientInputRow
+local RTBCorner = Instance.new("UICorner", RecipientTextBox)
+RTBCorner.CornerRadius = UDim.new(0, 6)
+
+local BtnRefreshPlayers = Instance.new("TextButton")
+BtnRefreshPlayers.Name = "BtnRefreshPlayers"
+BtnRefreshPlayers.Size = UDim2.new(0.28, -2, 1, 0)
+BtnRefreshPlayers.BackgroundColor3 = Color3.fromRGB(36, 45, 65)
+BtnRefreshPlayers.Text = "Pilih Online"
+BtnRefreshPlayers.TextColor3 = Color3.fromRGB(0, 220, 255)
+BtnRefreshPlayers.Font = Enum.Font.GothamBold
+BtnRefreshPlayers.TextSize = 11
+BtnRefreshPlayers.Parent = RecipientInputRow
+local BRP_Corner = Instance.new("UICorner", BtnRefreshPlayers)
+BRP_Corner.CornerRadius = UDim.new(0, 6)
+
+RecipientTextBox.FocusLost:Connect(function()
+    Config.TargetPlayerName = RecipientTextBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    AppendLog(string.format("[PENERIMA] Target disetel ke: %s", Config.TargetPlayerName), Color3.fromRGB(180, 220, 255))
+end)
+
+local PlayerDropdownContainer = Instance.new("ScrollingFrame")
+PlayerDropdownContainer.Name = "PlayerDropdownContainer"
+PlayerDropdownContainer.Size = UDim2.new(1, 0, 0, 100)
+PlayerDropdownContainer.BackgroundColor3 = Color3.fromRGB(18, 22, 32)
+PlayerDropdownContainer.BorderSizePixel = 0
+PlayerDropdownContainer.ScrollBarThickness = 3
+PlayerDropdownContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+PlayerDropdownContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+PlayerDropdownContainer.Visible = false
+PlayerDropdownContainer.LayoutOrder = 3
+PlayerDropdownContainer.Parent = RecipientCard
+local PDC_Corner = Instance.new("UICorner", PlayerDropdownContainer)
+PDC_Corner.CornerRadius = UDim.new(0, 6)
+local PDC_Layout = Instance.new("UIListLayout", PlayerDropdownContainer)
+PDC_Layout.SortOrder = Enum.SortOrder.LayoutOrder
+PDC_Layout.Padding = UDim.new(0, 3)
+
+RefreshPlayerDropdownUI = function()
+    for _, child in ipairs(PlayerDropdownContainer:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+
+    local plrs = {}
+    pcall(function()
+        plrs = Players:GetPlayers()
+    end)
+
+    local count = 0
+    for _, plr in ipairs(plrs) do
+        local pName, pDisp = "", ""
+        pcall(function()
+            pName = plr.Name
+            pDisp = plr.DisplayName
+        end)
+        if plr ~= LocalPlayer and pName ~= "" then
+            count = count + 1
+            local btn = Instance.new("TextButton")
+            btn.Name = "Plr_" .. pName
+            btn.Size = UDim2.new(1, -6, 0, 24)
+            btn.BackgroundColor3 = Color3.fromRGB(26, 32, 46)
+            btn.Text = string.format("  @%s (%s)", pName, pDisp)
+            btn.TextColor3 = Color3.fromRGB(200, 230, 255)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 10
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.LayoutOrder = count
+            btn.Parent = PlayerDropdownContainer
+            local bCorner = Instance.new("UICorner", btn)
+            bCorner.CornerRadius = UDim.new(0, 4)
+
+            btn.MouseButton1Click:Connect(function()
+                Config.TargetPlayerName = pName
+                RecipientTextBox.Text = pName
+                PlayerDropdownContainer.Visible = false
+                BtnRefreshPlayers.Text = "Pilih Online"
+                AppendLog(string.format("[PENERIMA] Dipilih: @%s", pName), Color3.fromRGB(100, 255, 180))
+            end)
+        end
+    end
+
+    if count == 0 then
+        local emptyLbl = Instance.new("TextButton")
+        emptyLbl.Size = UDim2.new(1, -6, 0, 24)
+        emptyLbl.BackgroundTransparency = 1
+        emptyLbl.Text = "  Tidak ada pemain lain di server."
+        emptyLbl.TextColor3 = Color3.fromRGB(140, 140, 150)
+        emptyLbl.Font = Enum.Font.Gotham
+        emptyLbl.TextSize = 10
+        emptyLbl.TextXAlignment = Enum.TextXAlignment.Left
+        emptyLbl.Parent = PlayerDropdownContainer
+    end
+end
+
+BtnRefreshPlayers.MouseButton1Click:Connect(function()
+    PlayerDropdownContainer.Visible = not PlayerDropdownContainer.Visible
+    BtnRefreshPlayers.Text = PlayerDropdownContainer.Visible and "Tutup List" or "Pilih Online"
+    if PlayerDropdownContainer.Visible then
+        RefreshPlayerDropdownUI()
+    end
+end)
+
+-------------------------------------------------------------------------------------------
+-- 4. SECTION: AUTO GIFT (TOGGLE & OPTIONS)
+-------------------------------------------------------------------------------------------
+local AutoGiftCard = CreateSectionCard(SenderScroll, "4. KONTROL AUTO GIFT", 4)
+
+local AutoGiftRow = Instance.new("Frame")
+AutoGiftRow.Name = "AutoGiftRow"
+AutoGiftRow.Size = UDim2.new(1, 0, 0, 36)
+AutoGiftRow.BackgroundColor3 = Color3.fromRGB(26, 32, 48)
+AutoGiftRow.LayoutOrder = 2
+AutoGiftRow.Parent = AutoGiftCard
+local AGR_Corner = Instance.new("UICorner", AutoGiftRow)
+AGR_Corner.CornerRadius = UDim.new(0, 6)
+
+local AutoGiftLabel = Instance.new("TextLabel")
+AutoGiftLabel.Name = "AutoGiftLabel"
+AutoGiftLabel.Size = UDim2.new(1, -60, 1, 0)
+AutoGiftLabel.Position = UDim2.new(0, 10, 0, 0)
+AutoGiftLabel.BackgroundTransparency = 1
+AutoGiftLabel.Text = "Auto Gift (Loop Otomatis)"
+AutoGiftLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoGiftLabel.Font = Enum.Font.GothamBold
+AutoGiftLabel.TextSize = 12
+AutoGiftLabel.TextXAlignment = Enum.TextXAlignment.Left
+AutoGiftLabel.Parent = AutoGiftRow
+
+local AutoGiftToggleBtn = Instance.new("TextButton")
+AutoGiftToggleBtn.Name = "AutoGiftToggleBtn"
+AutoGiftToggleBtn.Size = UDim2.new(0, 48, 0, 24)
+AutoGiftToggleBtn.Position = UDim2.new(1, -54, 0.5, -12)
+AutoGiftToggleBtn.BackgroundColor3 = Color3.fromRGB(60, 30, 40)
+AutoGiftToggleBtn.Text = "OFF"
+AutoGiftToggleBtn.TextColor3 = Color3.fromRGB(255, 120, 120)
+AutoGiftToggleBtn.Font = Enum.Font.GothamBold
+AutoGiftToggleBtn.TextSize = 11
+AutoGiftToggleBtn.Parent = AutoGiftRow
+local AGTB_Corner = Instance.new("UICorner", AutoGiftToggleBtn)
+AGTB_Corner.CornerRadius = UDim.new(0, 12)
+
+AutoGiftToggleBtn.MouseButton1Click:Connect(function()
+    Config.AutoGift = not Config.AutoGift
+    if Config.AutoGift then
+        AutoGiftToggleBtn.Text = "ON"
+        AutoGiftToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 180, 120)
+        AutoGiftToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        UpdateStatusUI("Auto Gift Aktif")
+        StartAutoGiftLoop()
+    else
+        AutoGiftToggleBtn.Text = "OFF"
+        AutoGiftToggleBtn.BackgroundColor3 = Color3.fromRGB(60, 30, 40)
+        AutoGiftToggleBtn.TextColor3 = Color3.fromRGB(255, 120, 120)
+        UpdateStatusUI("Idle")
+    end
+end)
+
+local OptionRow = Instance.new("Frame")
+OptionRow.Name = "OptionRow"
+OptionRow.Size = UDim2.new(1, 0, 0, 24)
+OptionRow.BackgroundTransparency = 1
+OptionRow.LayoutOrder = 3
+OptionRow.Parent = AutoGiftCard
+local OR_Layout = Instance.new("UIListLayout", OptionRow)
+OR_Layout.FillDirection = Enum.FillDirection.Horizontal
+OR_Layout.Padding = UDim.new(0, 12)
+
+local function CreateMiniCheckbox(parent, text, initialVal, onToggle)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(0.48, 0, 1, 0)
+    f.BackgroundTransparency = 1
+    f.Parent = parent
+
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 16, 0, 16)
+    b.Position = UDim2.new(0, 0, 0.5, -8)
+    b.BackgroundColor3 = initialVal and Color3.fromRGB(0, 180, 216) or Color3.fromRGB(36, 42, 58)
+    b.Text = initialVal and "X" or ""
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 9
+    b.Parent = f
+    local bc = Instance.new("UICorner", b)
+    bc.CornerRadius = UDim.new(0, 3)
+
+    local lbl = Instance.new("TextButton")
+    lbl.Size = UDim2.new(1, -22, 1, 0)
+    lbl.Position = UDim2.new(0, 20, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(180, 190, 210)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = f
+
+    local function Toggle()
+        local newVal = not (b.Text == "X")
+        b.Text = newVal and "X" or ""
+        b.BackgroundColor3 = newVal and Color3.fromRGB(0, 180, 216) or Color3.fromRGB(36, 42, 58)
+        onToggle(newVal)
+    end
+
+    b.MouseButton1Click:Connect(Toggle)
+    lbl.MouseButton1Click:Connect(Toggle)
+end
+
+CreateMiniCheckbox(OptionRow, "Lewati Favorit", Config.SkipFavorited, function(v)
+    Config.SkipFavorited = v
+end)
+
+CreateMiniCheckbox(OptionRow, "Mendekat ke Target", Config.AutoStandNearTarget, function(v)
+    Config.AutoStandNearTarget = v
+end)
+
+local BtnManualTrade = Instance.new("TextButton")
+BtnManualTrade.Name = "BtnManualTrade"
+BtnManualTrade.Size = UDim2.new(1, 0, 0, 28)
+BtnManualTrade.BackgroundColor3 = Color3.fromRGB(36, 50, 75)
+BtnManualTrade.Text = "Gift 1 Batch Sekarang (Manual)"
+BtnManualTrade.TextColor3 = Color3.fromRGB(220, 240, 255)
+BtnManualTrade.Font = Enum.Font.GothamBold
+BtnManualTrade.TextSize = 11
+BtnManualTrade.LayoutOrder = 4
+BtnManualTrade.Parent = AutoGiftCard
+local BMT_Corner = Instance.new("UICorner", BtnManualTrade)
+BMT_Corner.CornerRadius = UDim.new(0, 6)
+
+BtnManualTrade.MouseButton1Click:Connect(function()
+    AppendLog("[MANUAL] Menyiapkan pengiriman 1 batch trade...", Color3.fromRGB(120, 210, 255))
+    local ok, msg = SendTradeRequestToTarget()
+    AppendLog(msg, ok and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 100, 100))
+end)
+
+-- ========================================================================================
+-- 10. ELEMEN TAB PENERIMA (RECEIVER)
+-- ========================================================================================
+
+local ReceiverCard = CreateSectionCard(ReceiverFrame, "TAB PENERIMA (RECEIVER MODE)", 1)
+
+local AutoAccTradeRow = Instance.new("Frame")
+AutoAccTradeRow.Name = "AutoAccTradeRow"
+AutoAccTradeRow.Size = UDim2.new(1, 0, 0, 48)
+AutoAccTradeRow.BackgroundColor3 = Color3.fromRGB(26, 32, 48)
+AutoAccTradeRow.LayoutOrder = 2
+AutoAccTradeRow.Parent = ReceiverCard
+local AATR_Corner = Instance.new("UICorner", AutoAccTradeRow)
+AATR_Corner.CornerRadius = UDim.new(0, 8)
+
+local AutoAccBox = Instance.new("TextButton")
+AutoAccBox.Name = "AutoAccBox"
+AutoAccBox.Size = UDim2.new(0, 24, 0, 24)
+AutoAccBox.Position = UDim2.new(0, 12, 0.5, -12)
+AutoAccBox.BackgroundColor3 = Config.AutoAccTrade and Color3.fromRGB(0, 200, 130) or Color3.fromRGB(36, 42, 58)
+AutoAccBox.Text = Config.AutoAccTrade and "X" or ""
+AutoAccBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoAccBox.Font = Enum.Font.GothamBold
+AutoAccBox.TextSize = 13
+AutoAccBox.Parent = AutoAccTradeRow
+local AAB_Corner = Instance.new("UICorner", AutoAccBox)
+AAB_Corner.CornerRadius = UDim.new(0, 5)
+
+local AutoAccTextContainer = Instance.new("Frame")
+AutoAccTextContainer.Name = "TextContainer"
+AutoAccTextContainer.Size = UDim2.new(1, -50, 1, 0)
+AutoAccTextContainer.Position = UDim2.new(0, 44, 0, 0)
+AutoAccTextContainer.BackgroundTransparency = 1
+AutoAccTextContainer.Parent = AutoAccTradeRow
+
+local AutoAccTitle = Instance.new("TextButton")
+AutoAccTitle.Name = "Title"
+AutoAccTitle.Size = UDim2.new(1, 0, 0, 22)
+AutoAccTitle.Position = UDim2.new(0, 0, 0, 4)
+AutoAccTitle.BackgroundTransparency = 1
+AutoAccTitle.Text = "Auto Acc Trade"
+AutoAccTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoAccTitle.Font = Enum.Font.GothamBold
+AutoAccTitle.TextSize = 13
+AutoAccTitle.TextXAlignment = Enum.TextXAlignment.Left
+AutoAccTitle.Parent = AutoAccTextContainer
+
+local AutoAccDesc = Instance.new("TextLabel")
+AutoAccDesc.Name = "Desc"
+AutoAccDesc.Size = UDim2.new(1, 0, 0, 18)
+AutoAccDesc.Position = UDim2.new(0, 0, 0, 24)
+AutoAccDesc.BackgroundTransparency = 1
+AutoAccDesc.Text = "Otomatis terima request trade, klik Accept & Confirm"
+AutoAccDesc.TextColor3 = Color3.fromRGB(150, 165, 185)
+AutoAccDesc.Font = Enum.Font.Gotham
+AutoAccDesc.TextSize = 10
+AutoAccDesc.TextXAlignment = Enum.TextXAlignment.Left
+AutoAccDesc.Parent = AutoAccTextContainer
+
+local function ToggleAutoAcc()
+    Config.AutoAccTrade = not Config.AutoAccTrade
+    local active = Config.AutoAccTrade
+    AutoAccBox.Text = active and "X" or ""
+    AutoAccBox.BackgroundColor3 = active and Color3.fromRGB(0, 200, 130) or Color3.fromRGB(36, 42, 58)
+    if active then
+        AppendLog("[PENERIMA] Auto Acc Trade DIAKTIFKAN. Menunggu trade masuk...", Color3.fromRGB(100, 255, 140))
+        UpdateStatusUI("Receiver Aktif (Auto Acc)")
+    else
+        AppendLog("[PENERIMA] Auto Acc Trade DINONAKTIFKAN.", Color3.fromRGB(255, 160, 160))
+        UpdateStatusUI("Idle")
+    end
+end
+
+AutoAccBox.MouseButton1Click:Connect(ToggleAutoAcc)
+AutoAccTitle.MouseButton1Click:Connect(ToggleAutoAcc)
+
+local InfoCard = CreateSectionCard(ReceiverFrame, "CARA KERJA AKUN PENERIMA", 2)
+local InfoLabel = Instance.new("TextLabel")
+InfoLabel.Name = "InfoLabel"
+InfoLabel.Size = UDim2.new(1, 0, 0, 80)
+InfoLabel.BackgroundTransparency = 1
+InfoLabel.Text = "1. Centang [Auto Acc Trade] pada akun penerima.\n2. Saat akun pengirim mengirim trade, script akan otomatis menerima tanpa perlu klik konfirmasi.\n3. Begitu akun pengirim memasukkan buah dan menekan Accept, akun ini akan otomatis Accept.\n4. Setelah cooldown 5 detik selesai, otomatis menekan Confirm!"
+InfoLabel.TextColor3 = Color3.fromRGB(180, 195, 215)
+InfoLabel.Font = Enum.Font.Gotham
+InfoLabel.TextSize = 10
+InfoLabel.TextWrapped = true
+InfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+InfoLabel.TextYAlignment = Enum.TextYAlignment.Top
+InfoLabel.LayoutOrder = 2
+InfoLabel.Parent = InfoCard
+
+-- ========================================================================================
+-- 11. STARTUP & BACKPACK SYNC
+-- ========================================================================================
+task.spawn(function()
+    ScanBackpackFruits()
+    RefreshFruitDropdownUI()
+    RefreshMutationDropdownUI()
+    RefreshPlayerDropdownUI()
+    AppendLog("[READY] Script HUKI Fruit Gifter berhasil dimuat!", Color3.fromRGB(100, 255, 160))
+
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if bp then
+        bp.ChildAdded:Connect(function()
+            task.wait(0.2)
+            ScanBackpackFruits()
+            RefreshFruitDropdownUI()
+        end)
+        bp.ChildRemoved:Connect(function()
+            task.wait(0.2)
+            ScanBackpackFruits()
+            RefreshFruitDropdownUI()
+        end)
+    end
+end)
+
+return ScreenGui
